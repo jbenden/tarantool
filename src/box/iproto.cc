@@ -30,7 +30,6 @@
  */
 #include "iproto.h"
 #include <string.h>
-#include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
 
@@ -57,6 +56,7 @@
 #include "replication.h" /* instance_uuid */
 #include "iproto_constants.h"
 #include "rmean.h"
+#include "execute.h"
 
 /* The number of iproto messages in flight */
 enum { IPROTO_MSG_MAX = 768 };
@@ -299,6 +299,8 @@ tx_process1(struct cmsg *msg);
 static void
 tx_process_select(struct cmsg *msg);
 static void
+tx_process_sql(struct cmsg *m);
+static void
 net_send_msg(struct cmsg *msg);
 
 static void
@@ -382,6 +384,11 @@ static const struct cmsg_hop process1_route[] = {
 	{ net_send_msg, NULL },
 };
 
+static const struct cmsg_hop sql_route[] = {
+	{ tx_process_sql, &net_pipe },
+	{ net_send_msg, NULL },
+};
+
 static const struct cmsg_hop *dml_route[IPROTO_TYPE_STAT_MAX] = {
 	NULL,                                   /* IPROTO_OK */
 	select_route,                           /* IPROTO_SELECT */
@@ -393,7 +400,8 @@ static const struct cmsg_hop *dml_route[IPROTO_TYPE_STAT_MAX] = {
 	misc_route,                             /* IPROTO_AUTH */
 	misc_route,                             /* IPROTO_EVAL */
 	process1_route,                         /* IPROTO_UPSERT */
-	misc_route                              /* IPROTO_CALL */
+	misc_route,                             /* IPROTO_CALL */
+	sql_route,                              /* IPROTO_EXECUTE */
 };
 
 static const struct cmsg_hop sync_route[] = {
@@ -561,6 +569,76 @@ iproto_connection_input_iobuf(struct iproto_connection *con)
 	return newbuf;
 }
 
+/**
+ * Fast parser for the EXECUTE request. Request_decode is not
+ * needed here, because:
+ *     - EXECUTE request is much simpler, than the common request
+ *       for DML and misc operations;
+ *     - Addition of the EXECUTE to request_decode could slow down
+ *       the hot struct request parser.
+ *
+ * @param[out] request Request to decode to.
+ * @param data EXECUTE body.
+ * @param len Byte length of the @data.
+ */
+static int
+sql_request_decode(struct request *request, const char *data, uint32_t len)
+{
+	assert(request->header->type == IPROTO_EXECUTE);
+	const char *end = data + len;
+	if (mp_typeof(*data) != MP_MAP || mp_check_map(data, end) > 0) {
+error:
+		diag_set(ClientError, ER_INVALID_MSGPACK, "packet body");
+		return -1;
+	}
+	uint32_t size = mp_decode_map(&data);
+	/*
+	 * Can not use a key_map, because SQL_BIND is greater than
+	 * 64, and the mask
+	 * (1ULL << SQL_BIND) | (1ULL << SQL_TEXT) can't be stored
+	 * into an uint64 variable.
+	 * Instead, lets use equality to NULL of the some request
+	 * attributes as the flags.
+	 */
+	request->tuple = NULL;
+	request->key = NULL;
+	for (uint32_t i = 0; i < size; ++i) {
+		uint64_t key = mp_decode_uint(&data);
+		const char *value = data;
+		if (mp_check(&data, end) != 0)
+			goto error;
+		switch (key) {
+			case IPROTO_SQL_BIND:
+				request->tuple = value;
+				request->tuple_end = data;
+				break;
+			case IPROTO_SQL_TEXT:
+				request->key = value;
+				request->key_end = data;
+				break;
+			default:
+				break;
+		}
+	}
+#ifndef NDEBUG
+	if (data != end) {
+		diag_set(ClientError, ER_INVALID_MSGPACK, "packet end");
+		return -1;
+	}
+#endif
+	if (request->key == NULL || request->tuple == NULL) {
+		enum iproto_key key;
+		if (request->key == NULL)
+			key = IPROTO_SQL_TEXT;
+		else
+			key = IPROTO_SQL_BIND;
+		diag_set(ClientError, ER_MISSING_REQUEST_FIELD,
+			  iproto_key_name(key));
+		return -1;
+	}
+	return 0;
+}
+
 static void
 iproto_decode_msg(struct iproto_msg *msg, const char **pos, const char *reqend,
 		  bool *stop_input)
@@ -569,6 +647,7 @@ iproto_decode_msg(struct iproto_msg *msg, const char **pos, const char *reqend,
 	assert(*pos == reqend);
 	request_create(&msg->request, msg->header.type);
 	msg->request.header = &msg->header;
+	const char *body;
 
 	switch (msg->header.type) {
 	case IPROTO_SELECT:
@@ -592,8 +671,8 @@ iproto_decode_msg(struct iproto_msg *msg, const char **pos, const char *reqend,
 			tnt_raise(ClientError, ER_INVALID_MSGPACK,
 				  "missing request body");
 		}
-		request_decode_xc(&msg->request,
-				 (const char *) msg->header.body[0].iov_base,
+		body = (const char *) msg->header.body[0].iov_base;
+		request_decode_xc(&msg->request, body,
 				 msg->header.body[0].iov_len,
 				 request_key_map(msg->header.type));
 		assert(msg->header.type < sizeof(dml_route)/sizeof(*dml_route));
@@ -606,6 +685,16 @@ iproto_decode_msg(struct iproto_msg *msg, const char **pos, const char *reqend,
 	case IPROTO_SUBSCRIBE:
 		cmsg_init(msg, sync_route);
 		*stop_input = true;
+		break;
+	case IPROTO_EXECUTE:
+		if (msg->header.bodycnt == 0)
+			tnt_raise(ClientError, ER_INVALID_MSGPACK,
+				  "missing request body");
+		body = (const char *) msg->header.body[0].iov_base;
+		if (sql_request_decode(&msg->request, body,
+				       msg->header.body[0].iov_len) != 0)
+			diag_raise();
+		cmsg_init(msg, sql_route);
 		break;
 	default:
 		tnt_raise(ClientError, ER_UNKNOWN_REQUEST_TYPE,
@@ -935,6 +1024,93 @@ error:
 	msg->write_end = obuf_create_svp(out);
 }
 
+/**
+ * Execute the sql query and encode the response in an iproto
+ * message.
+ * Response structure:
+ * +----------------------------------------------+
+ * | IPROTO_OK, sync, schema_version   ...        | iproto_header
+ * +----------------------------------------------+---------------
+ * | Body - map with two keys.                    |
+ * |                                              |
+ * | IPROTO_BODY: {                               |
+ * |     IPROTO_DESCRIPTION: [                    |
+ * |         {IPROTO_FIELD_NAME: column name1},   |
+ * |         {IPROTO_FIELD_NAME: column name2},   | iproto_body
+ * |         ...                                  |
+ * |     ],                                       |
+ * |                                              |
+ * |     IPROTO_DATA: [                           |
+ * |         tuple, tuple, tuple, ...             |
+ * |     ]                                        |
+ * | }                                            |
+ * +----------------------------------------------+
+ *
+ * @param request IProto request.
+ * @param out     Out buffer of the iproto message.
+ * @param region  Region memory allocator.
+ */
+static int
+tx_sql_execute_and_encode(struct request *request, struct obuf *out,
+			  struct region *region)
+{
+	struct tuple *description = NULL;
+	struct port port;
+	port_create(&port);
+	const char *sql = request->key;
+	char *begin, *pos;
+	struct obuf_svp svp = obuf_create_svp(out);
+	uint32_t length;
+	sql = mp_decode_str(&sql, &length);
+	const char *parameters;
+	uint32_t parameter_count;
+	if (request->tuple != NULL) {
+		parameters = request->tuple;
+		parameter_count = mp_decode_array(&parameters);
+	} else {
+		parameters = NULL;
+		parameter_count = 0;
+	}
+
+	if (sql_execute(sql, length, parameters, parameter_count, &description,
+			&port, region) != 0)
+		goto error;
+	if (description == NULL) {
+		/* Request with boolean result. */
+		iproto_reply_ok(out, request->header->sync, ::schema_version);
+		port_destroy(&port);
+		return 0;
+	}
+	/* Size of the iproto header and sql description. */
+	length = IPROTO_HEADER_LEN + mp_sizeof_map(2) +
+		 mp_sizeof_uint(IPROTO_DESCRIPTION) + description->bsize +
+		 mp_sizeof_uint(IPROTO_DATA) + mp_sizeof_array(port.size);
+	pos = (char *) obuf_alloc(out, length);
+	if (pos == NULL) {
+		tuple_unref(description);
+		goto error;
+	}
+	/* Encode header, description and data. */
+	begin = pos;
+	pos += IPROTO_HEADER_LEN;
+	pos = mp_encode_map(pos, 2);
+	pos = mp_encode_uint(pos, IPROTO_DESCRIPTION);
+	pos += tuple_to_buf(description, pos, description->bsize);
+	pos = mp_encode_uint(pos, IPROTO_DATA);
+	pos = mp_encode_array(pos, port.size);
+	tuple_unref(description);
+	port_dump(&port, out);
+	length = obuf_size(out) - svp.used - IPROTO_HEADER_LEN;
+	iproto_header_encode(begin, IPROTO_OK, request->header->sync,
+			     ::schema_version, length);
+	return 0;
+
+error:
+	port_destroy(&port);
+	obuf_rollback_to_svp(out, &svp);
+	return -1;
+}
+
 static void
 tx_process_misc(struct cmsg *m)
 {
@@ -974,6 +1150,27 @@ tx_process_misc(struct cmsg *m)
 	}
 	msg->write_end = obuf_create_svp(out);
 	return;
+error:
+	iproto_reply_error(out, diag_last_error(&fiber()->diag),
+			   msg->header.sync, ::schema_version);
+	msg->write_end = obuf_create_svp(out);
+}
+
+static void
+tx_process_sql(struct cmsg *m)
+{
+	struct iproto_msg *msg = (struct iproto_msg *) m;
+	struct obuf *out = &msg->iobuf->out;
+
+	tx_fiber_init(msg->connection->session, msg->header.sync);
+
+	if (tx_check_schema(msg->header.schema_version))
+		goto error;
+	assert(msg->header.type == IPROTO_EXECUTE);
+	if (tx_sql_execute_and_encode(&msg->request, out, &fiber()->gc) == 0) {
+		msg->write_end = obuf_create_svp(out);
+		return;
+	}
 error:
 	iproto_reply_error(out, diag_last_error(&fiber()->diag),
 			   msg->header.sync, ::schema_version);
