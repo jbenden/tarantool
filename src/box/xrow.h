@@ -121,8 +121,60 @@ iproto_header_encode(char *data, uint32_t type, uint64_t sync,
 struct obuf;
 struct obuf_svp;
 
+/**
+ * Prepare the iproto header for a select result set.
+ * @param buf Out buffer.
+ * @param svp Savepoint of the header beginning.
+ *
+ * @retval  0 Success.
+ * @retval -1 Memory error.
+ */
 int
 iproto_prepare_select(struct obuf *buf, struct obuf_svp *svp);
+
+/**
+ * Prepare the iproto header for an SQL result set. SQL iproto
+ * body has two keys, instead of other request types.
+ * Example:
+ * iproto_prepare_sql()
+ *     iproto_prepare_description()
+ *     ...
+ *     iproto_reply_description()
+ *     iproto_prepare_data()
+ *     ...
+ *     iproto_reply_data()
+ * iproto_reply_sql()
+ *
+ * @param buf Out buffer.
+ * @param svp Savepoint of the header beginning.
+ *
+ * @retval  0 Success.
+ * @retval -1 Memory error.
+ */
+int
+iproto_prepare_sql(struct obuf *buf, struct obuf_svp *svp);
+
+/**
+ * Prepare the header of the description in the body.
+ * @param buf Out buffer.
+ * @param svp Savepoint of the header beginning.
+ *
+ * @retval  0 Success.
+ * @retval -1 Memory error.
+ */
+int
+iproto_prepare_description(struct obuf *buf, struct obuf_svp *svp);
+
+/**
+ * Prepare the header of the data in the body.
+ * @param buf Out buffer.
+ * @param svp Savepoint of the header beginning.
+ *
+ * @retval  0 Success.
+ * @retval -1 Memory error.
+ */
+int
+iproto_prepare_data(struct obuf *buf, struct obuf_svp *svp);
 
 /**
  * Write select header to a preallocated buffer.
@@ -143,6 +195,36 @@ iproto_reply_ok(struct obuf *out, uint64_t sync, uint32_t schema_version);
 int
 iproto_reply_error(struct obuf *out, const struct error *e, uint64_t sync,
 		   uint32_t schema_version);
+
+/**
+ * Write the description header.
+ * @param buf Out buffer.
+ * @param svp Savepoint of the header beginning.
+ * @param count Count of description elements.
+ */
+void
+iproto_reply_description(struct obuf *buf, struct obuf_svp *svp,
+			 uint32_t count);
+
+/**
+ * Write the data header.
+ * @param buf Out buffer.
+ * @param svp Savepoint of the header beginning.
+ * @param count Count of data elements.
+ */
+void
+iproto_reply_data(struct obuf *buf, struct obuf_svp *svp, uint32_t count);
+
+/**
+ * Write the SQL header.
+ * @param buf Out buffer.
+ * @param svp Savepoint of the header beginning.
+ * @param sync Request sync.
+ * @param schema_version Schema version.
+ */
+void
+iproto_reply_sql(struct obuf *buf, struct obuf_svp *svp, uint64_t sync,
+		 uint32_t schema_version);
 
 /** Write error directly to a socket. */
 void

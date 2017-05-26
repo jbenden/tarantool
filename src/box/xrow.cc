@@ -205,6 +205,20 @@ struct PACKED iproto_header_bin {
 	uint32_t v_schema_version;              /* schema_version */
 };
 
+struct PACKED iproto_body_key_bin {
+	uint8_t key;       /* IPROTO_DATA/DESCRIPTION */
+	uint8_t value_len;
+	uint32_t value;
+};
+
+static const struct iproto_body_key_bin iproto_body_data_bin = {
+	IPROTO_DATA, 0xdd, 0,
+};
+
+static const struct iproto_body_key_bin iproto_body_description_bin = {
+	IPROTO_DESCRIPTION, 0xdd, 0,
+};
+
 static_assert(sizeof(struct iproto_header_bin) == IPROTO_HEADER_LEN,
 	      "sizeof(iproto_header_bin)");
 
@@ -309,25 +323,64 @@ iproto_write_error(int fd, const struct error *e, uint32_t schema_version)
 	(void) fcntl(fd, F_SETFL, flags);
 }
 
-enum { SVP_SIZE = IPROTO_HEADER_LEN  + sizeof(iproto_body_bin) };
+enum {
+	PREPARE_SELECT_SIZE = IPROTO_HEADER_LEN  + sizeof(iproto_body_bin),
+	/**
+	 * mp_sizeof(IPROTO_DATA/IPROTO_DESCRIPTION) +
+	 * mp_sizeof_array(UINT32_MAX).
+	 */
+	PREPARE_BODY_KEY_SIZE = 1 + 5,
+	/**
+	 * Header of message + header of body with two keys:
+	 * IPROTO_DATA and IPROTO_DESCRIPTION.
+	 * 1 == mp_sizeof_map(2).
+	 */
+	PREPARE_SQL_SIZE = IPROTO_HEADER_LEN + 1,
+};
+static_assert(IPROTO_DATA < 0x7f && IPROTO_DESCRIPTION < 0x7f,
+	      "encoded IPROTO_BODY keys must fit into one byte");
 
-int
-iproto_prepare_select(struct obuf *buf, struct obuf_svp *svp)
+static inline int
+iproto_prepare_header(struct obuf *buf, struct obuf_svp *svp, size_t size)
 {
 	/**
 	 * Reserve memory before taking a savepoint.
 	 * This ensures that we get a contiguous chunk of memory
 	 * and the savepoint is pointing at the beginning of it.
 	 */
-	void *ptr = obuf_reserve(buf, SVP_SIZE);
+	void *ptr = obuf_reserve(buf, size);
 	if (ptr == NULL) {
-		diag_set(OutOfMemory, SVP_SIZE, "obuf", "reserve");
+		diag_set(OutOfMemory, size, "obuf_reserve", "ptr");
 		return -1;
 	}
 	*svp = obuf_create_svp(buf);
-	ptr = obuf_alloc(buf, SVP_SIZE);
+	ptr = obuf_alloc(buf, size);
 	assert(ptr !=  NULL);
 	return 0;
+}
+
+int
+iproto_prepare_select(struct obuf *buf, struct obuf_svp *svp)
+{
+	return iproto_prepare_header(buf, svp, PREPARE_SELECT_SIZE);
+}
+
+int
+iproto_prepare_description(struct obuf *buf, struct obuf_svp *svp)
+{
+	return iproto_prepare_header(buf, svp, PREPARE_BODY_KEY_SIZE);
+}
+
+int
+iproto_prepare_data(struct obuf *buf, struct obuf_svp *svp)
+{
+	return iproto_prepare_header(buf, svp, PREPARE_BODY_KEY_SIZE);
+}
+
+int
+iproto_prepare_sql(struct obuf *buf, struct obuf_svp *svp)
+{
+	return iproto_prepare_header(buf, svp, PREPARE_SQL_SIZE);
 }
 
 void
@@ -343,6 +396,35 @@ iproto_reply_select(struct obuf *buf, struct obuf_svp *svp, uint64_t sync,
 	body.v_data_len = mp_bswap_u32(count);
 
 	memcpy(pos + IPROTO_HEADER_LEN, &body, sizeof(body));
+}
+
+void
+iproto_reply_description(struct obuf *buf, struct obuf_svp *svp, uint32_t count)
+{
+	char *pos = (char *) obuf_svp_to_ptr(buf, svp);
+	struct iproto_body_key_bin bin = iproto_body_description_bin;
+	bin.value = mp_bswap_u32(count);
+	memcpy(pos, &bin, sizeof(bin));
+}
+
+void
+iproto_reply_data(struct obuf *buf, struct obuf_svp *svp, uint32_t count)
+{
+	char *pos = (char *) obuf_svp_to_ptr(buf, svp);
+	struct iproto_body_key_bin bin = iproto_body_data_bin;
+	bin.value = mp_bswap_u32(count);
+	memcpy(pos, &bin, sizeof(bin));
+}
+
+void
+iproto_reply_sql(struct obuf *buf, struct obuf_svp *svp, uint64_t sync,
+		 uint32_t schema_version)
+{
+	char *pos = (char *) obuf_svp_to_ptr(buf, svp);
+	iproto_header_encode(pos, IPROTO_OK, sync, schema_version,
+			     obuf_size(buf) - svp->used - IPROTO_HEADER_LEN);
+	/* mp_encode_map(2). */
+	*(pos + IPROTO_HEADER_LEN) = 0x82;
 }
 
 void
