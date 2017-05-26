@@ -202,10 +202,11 @@ t;
   - INSERT
   - EVAL
   - CALL
+  - ERROR
   - REPLACE
   - UPSERT
   - AUTH
-  - ERROR
+  - EXECUTE
   - UPDATE
   - total
   - rps
