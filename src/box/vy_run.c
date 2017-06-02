@@ -2023,6 +2023,9 @@ vy_run_write_page(struct vy_run_info *run_info, struct xlog *data_xlog,
 	struct vy_page_info *page = NULL;
 	const char *region_key;
 	bool end_of_run = false;
+	/* Last written statement */
+	struct tuple *last_stmt = *curr_stmt;
+	vy_stmt_ref_if_possible(last_stmt);
 
 	/* row offsets accumulator */
 	struct ibuf page_index_buf;
@@ -2058,8 +2061,6 @@ vy_run_write_page(struct vy_run_info *run_info, struct xlog *data_xlog,
 	vy_page_info_create(page, data_xlog->offset, *curr_stmt, key_def);
 	xlog_tx_begin(data_xlog);
 
-	/* Last written statement */
-	struct tuple *last_stmt = *curr_stmt;
 	do {
 		uint32_t *offset = (uint32_t *) ibuf_alloc(&page_index_buf,
 							   sizeof(uint32_t));
@@ -2085,8 +2086,11 @@ vy_run_write_page(struct vy_run_info *run_info, struct xlog *data_xlog,
 
 		if (*curr_stmt == NULL)
 			end_of_run = true;
-		else
+		else {
+			vy_stmt_unref_if_possible(last_stmt);
 			last_stmt = *curr_stmt;
+			vy_stmt_ref_if_possible(last_stmt);
+		}
 	} while (end_of_run == false &&
 		 obuf_size(&data_xlog->obuf) < page_size);
 
@@ -2109,6 +2113,7 @@ vy_run_write_page(struct vy_run_info *run_info, struct xlog *data_xlog,
 		if (run_info->max_key == NULL)
 			goto error_rollback;
 	}
+	vy_stmt_unref_if_possible(last_stmt);
 
 	/* Save offset to row index  */
 	page->page_index_offset = page->unpacked_size;
@@ -2143,10 +2148,11 @@ vy_run_write_page(struct vy_run_info *run_info, struct xlog *data_xlog,
 	ibuf_destroy(&page_index_buf);
 	return !end_of_run ? 0: 1;
 
-	error_rollback:
+error_rollback:
 	xlog_tx_rollback(data_xlog);
-	error_page_index:
+error_page_index:
 	ibuf_destroy(&page_index_buf);
+	vy_stmt_unref_if_possible(last_stmt);
 	return -1;
 }
 
