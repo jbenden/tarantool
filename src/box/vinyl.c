@@ -1160,10 +1160,7 @@ tx_manager_read_view(struct tx_manager *xm)
 		rv->vlsn = xm->lsn;
 		rv->refs = 1;
 	}
-	/*
-	 * Add to the tail of the list, so that tx_manager_vlsn()
-	 * works correctly.
-	 */
+
 	rlist_add_tail_entry(&xm->read_views, rv,
 			     in_read_views);
 	return rv;
@@ -1192,24 +1189,6 @@ tx_manager_delete(struct tx_manager *m)
 	mempool_destroy(&m->tx_mempool);
 	free(m);
 	return 0;
-}
-
-/*
- * Determine a lowest possible vlsn - the level below which the
- * history could be compacted.
- * If there are active read views, it is the first's vlsn. If there is
- * no active read view, a read view could be created at any moment
- * with vlsn = m->lsn, so m->lsn must be chosen.
- */
-static int64_t
-tx_manager_vlsn(struct tx_manager *xm)
-{
-	if (rlist_empty(&xm->read_views))
-		return xm->lsn;
-	struct vy_read_view *oldest = rlist_first_entry(&xm->read_views,
-							struct vy_read_view,
-							in_read_views);
-	return oldest->vlsn;
 }
 
 static void
@@ -3262,7 +3241,7 @@ vy_task_dump_new(struct vy_index *index, struct vy_task **p_task)
 	bool is_last_level = (index->run_count == 0);
 	wi = vy_write_iterator_new(index->key_def, index->surrogate_format,
 				   index->upsert_format, index->id == 0,
-				   is_last_level, tx_manager_vlsn(xm));
+				   is_last_level, &xm->read_views);
 	if (wi == NULL)
 		goto err_wi;
 	rlist_foreach_entry(mem, &index->sealed, in_sealed) {
@@ -3509,7 +3488,7 @@ vy_task_compact_new(struct vy_range *range, struct vy_task **p_task)
 	bool is_last_level = (range->compact_priority == range->slice_count);
 	wi = vy_write_iterator_new(index->key_def, index->surrogate_format,
 				   index->upsert_format, index->id == 0,
-				   is_last_level, tx_manager_vlsn(xm));
+				   is_last_level, &xm->read_views);
 	if (wi == NULL)
 		goto err_wi;
 
@@ -7976,9 +7955,11 @@ vy_send_range(struct vy_join_ctx *ctx)
 		return 0; /* nothing to do */
 
 	int rc = -1;
+	struct rlist fake_read_views;
+	rlist_create(&fake_read_views);
 	ctx->wi = vy_write_iterator_new(ctx->key_def,
 					ctx->format, ctx->upsert_format,
-					true, true, INT64_MAX);
+					true, true, &fake_read_views);
 	if (ctx->wi == NULL)
 		goto out;
 
