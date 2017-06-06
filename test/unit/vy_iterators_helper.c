@@ -80,7 +80,7 @@ end:
 	return ret;
 }
 
-void
+const struct tuple *
 vy_mem_insert_template(struct vy_mem *mem, const struct vy_stmt_template *templ)
 {
 	struct tuple *stmt;
@@ -96,6 +96,7 @@ vy_mem_insert_template(struct vy_mem *mem, const struct vy_stmt_template *templ)
 	assert(region_stmt != NULL);
 	tuple_unref(stmt);
 	vy_mem_insert(mem, region_stmt);
+	return region_stmt;
 }
 
 void
