@@ -6430,9 +6430,12 @@ vy_tx_rollback_after_prepare(struct vy_tx *tx)
 
 	struct txv *v;
 	stailq_foreach_entry(v, &tx->log, next_in_log) {
-		if (v->region_stmt != NULL)
+		if (v->region_stmt != NULL) {
 			vy_index_rollback_stmt(v->index, v->mem,
 					       v->region_stmt);
+			/* Mark the statement as deleted */
+			vy_stmt_set_lsn((struct tuple *)v->region_stmt, 0);
+		}
 		if (v->mem != 0)
 			vy_mem_unpin(v->mem);
 	}
@@ -7510,6 +7513,704 @@ vy_merge_iterator_restore(struct vy_merge_iterator *itr,
 
 /* {{{ Iterator over index */
 
+/**
+ * ID of iterator source type. Can be used in bitmap.
+ */
+enum iterator_src_type {
+	ITER_SRC_NONE = 0,
+	ITER_SRC_TXW = 1,
+	ITER_SRC_CACHE = 2,
+	ITER_SRC_MEM = 4,
+	ITER_SRC_RUN = 8,
+};
+
+/**
+ * History of a key in vinyl is a continuous sequence of statements of the
+ * same key in order of decreasing lsn. The history can be represented as a
+ * list, the structure below describes one node of the list.
+ */
+struct vy_stmt_history_node {
+	/* Type of source that the history statement came from */
+	enum iterator_src_type src_type;
+	/* The history statement. Can be refable but not for mems */
+	union {
+		const struct tuple *stmt;
+		struct tuple *refable_stmt;
+	};
+	/* If the statement came from a mem, it's saved here */
+	struct vy_mem *mem;
+	/* Link in the history list */
+	struct rlist link;
+};
+
+/**
+ * One iterator is a special read iterator that is designed for
+ * retrieving one value from index by a full key (all parts are present).
+ *
+ * Iterator collects necessary history of given key from different sources
+ * (txw, cache, mems, runs) that consists of some number of sequential upserts
+ * and possibly one terminal statement (replace or delete). The iterator
+ * sequentially scans txw, cache, mems and runs until a terminal statement is
+ * met. If a yield has happened, the iterator scans again mems and runs in
+ * order to append to Whistory newer statements that may arrive during yield.
+ * This next round of scan is done until we ensure that the history is appended
+ * with all newer statements. Normally scanning one newest mem is enough for
+ * fulfilling the history, but there's an unlilkely case when some runs
+ * must be read, that causes yield, that causes next round of scan etc. But
+ * again, it's an unlikely case.
+ *
+ * After the history is collected the iterator calculates resultant statement
+ * and, if there are no newer statements in index, adds it to cache.
+ */
+struct vy_one_iterator {
+	/* Search location and options */
+	struct vy_index *index;
+	struct vy_tx *tx;
+	const struct vy_read_view **p_read_view;
+	const struct tuple *key;
+
+	/**
+	 *  For compatibility reasons, the iterator references the
+	 * resultant statement until own destruction.
+	 */
+	struct tuple *curr_stmt;
+};
+
+/**
+ * Create an iterator by full key.
+ */
+static void
+vy_one_iterator_open(struct vy_one_iterator *itr, struct vy_index *index,
+		     struct vy_tx *tx, const struct vy_read_view **rv,
+		     const struct tuple *key)
+{
+	vy_index_ref(index);
+	itr->index = index;
+	itr->tx = tx;
+	itr->p_read_view = rv;
+	itr->key = key;
+
+	itr->curr_stmt = NULL;
+}
+
+/**
+ * Allocate (region) new history node.
+ * @return new node or NULL on memory error (diag is set).
+ */
+static struct vy_stmt_history_node *
+vy_one_iterator_new_node()
+{
+	struct region *region = &fiber()->gc;
+	struct vy_stmt_history_node *node = region_alloc(region, sizeof(*node));
+	if (node == NULL)
+		diag_set(OutOfMemory, sizeof(*node), "region",
+			 "struct vy_stmt_history_node");
+	return node;
+}
+
+/**
+ * Unref statement/mem if necessary, remove node from history if it's there.
+ */
+static void
+vy_one_iterator_destroy_node(struct vy_stmt_history_node *node)
+{
+	if (node->src_type == ITER_SRC_MEM)
+		vy_mem_unref(node->mem);
+	else if (node->src_type == ITER_SRC_RUN)
+		tuple_unref(node->refable_stmt);
+	if (node->src_type != ITER_SRC_NONE)
+		rlist_del(&node->link);
+	node->src_type = ITER_SRC_NONE;
+}
+
+/**
+ * Free resources and close the iterator.
+ */
+static void
+vy_one_iterator_close(struct vy_one_iterator *itr)
+{
+	if (itr->curr_stmt != NULL)
+		tuple_unref(itr->curr_stmt);
+	vy_index_unref(itr->index);
+	TRASH(itr);
+}
+
+/**
+ * Scan TX write set for given key.
+ *
+ * If found statement is terminal, @a terminal_node is filled and put to history.
+ *
+ * If the found statement is upsert, it is NOT put to history; instead,
+ * @a txw_history_node is filled with found statement to be added to
+ * history after all rounds made to ensure that the statement would be
+ * the first statement in history.
+ */
+static void
+vy_one_iterator_scan_txw(struct vy_one_iterator *itr,
+			 struct rlist *history,
+			 struct vy_stmt_history_node *txw_node,
+			 struct vy_stmt_history_node *terminal_node,
+			 bool *terminal_found)
+{
+	struct vy_tx *tx = itr->tx;
+	if (tx == NULL)
+		return;
+	struct txv *txv =
+		write_set_search_key(&tx->write_set, itr->index, itr->key);
+	if (txv == NULL)
+		return;
+	if (vy_stmt_type(txv->stmt) == IPROTO_UPSERT) {
+		txw_node->src_type = ITER_SRC_TXW;
+		txw_node->stmt = txv->stmt;
+	} else {
+		assert(vy_stmt_type(txv->stmt) == IPROTO_REPLACE ||
+		       vy_stmt_type(txv->stmt) == IPROTO_DELETE);
+		terminal_node->src_type = ITER_SRC_TXW;
+		terminal_node->stmt = txv->stmt;
+		rlist_add_tail(history, &terminal_node->link);
+		*terminal_found = true;
+	}
+}
+
+/**
+ * Scan index cache for given key.
+ *
+ * Only terminal statements are present in cache, so if one found,
+ * @a terminal node is inserted into history.
+ */
+static void
+vy_one_iterator_scan_cache(struct vy_one_iterator *itr,
+			   struct rlist *history,
+			   struct vy_stmt_history_node *terminal_node,
+			   bool *terminal_found)
+{
+	struct tuple *stmt = vy_cache_get(&itr->index->cache, itr->key);
+
+	if (stmt == NULL || vy_stmt_lsn(stmt) > (*itr->p_read_view)->vlsn)
+		return;
+
+	assert(terminal_node->src_type == ITER_SRC_NONE);
+	terminal_node->src_type = ITER_SRC_CACHE;
+	terminal_node->stmt =  stmt;
+	rlist_add_tail(history, &terminal_node->link);
+	*terminal_found = true;
+}
+
+/**
+ * Scan one particular mem. Collect history of a key. For every collected
+ * statement the run is referenced.
+ */
+static int
+vy_one_iterator_scan_mem(struct vy_one_iterator *itr, struct vy_mem *mem,
+			 struct rlist *history,
+			 struct vy_stmt_history_node *terminal_node,
+			 bool *terminal_found,  bool *prev_history_reached,
+			 bool *track_latest,
+			 int64_t got_history_lsn)
+{
+	if (mem != itr->index->mem && mem->max_lsn <= got_history_lsn) {
+		*prev_history_reached = true;
+		return 0;
+	}
+
+	struct tree_mem_key tree_key;
+	tree_key.stmt = itr->key;
+	tree_key.lsn = (*itr->p_read_view)->vlsn;
+	bool exact;
+	struct vy_mem_tree_iterator mem_itr =
+		vy_mem_tree_lower_bound(&mem->tree, &tree_key, &exact);
+	itr->index->env->stat->mem_stat.lookup_count++;
+
+	const struct tuple *stmt =
+		vy_mem_tree_iterator_is_invalid(&mem_itr) ? NULL :
+		*vy_mem_tree_iterator_get_elem(&mem->tree, &mem_itr);
+	if (stmt && vy_stmt_compare(stmt, itr->key, mem->key_def) != 0)
+		stmt = NULL;
+
+	if (*track_latest && rlist_empty(history)) {
+		struct vy_mem_tree_iterator prev = mem_itr;
+		if (vy_mem_tree_iterator_is_invalid(&prev))
+			prev = vy_mem_tree_iterator_last(&mem->tree);
+		else
+			vy_mem_tree_iterator_prev(&mem->tree, &prev);
+		itr->index->env->stat->mem_stat.step_count++;
+		if (!vy_mem_tree_iterator_is_invalid(&prev)) {
+			const struct tuple *prev_stmt =
+				*vy_mem_tree_iterator_get_elem(&mem->tree,
+							       &prev);
+			if ((stmt == NULL ||
+			     vy_stmt_lsn(prev_stmt) > vy_stmt_lsn(stmt)) &&
+			    vy_stmt_compare(prev_stmt, itr->key,
+					    mem->key_def) == 0)
+				*track_latest = false;
+		}
+	}
+
+	if (stmt == NULL)
+		return 0;
+
+	while (true) {
+		if (vy_stmt_lsn(stmt) <= got_history_lsn) {
+			*prev_history_reached = true;
+			break;
+		}
+		if (vy_stmt_type(stmt) != IPROTO_UPSERT) {
+			vy_one_iterator_destroy_node(terminal_node);
+			terminal_node->src_type = ITER_SRC_MEM;
+			terminal_node->stmt = stmt;
+			terminal_node->mem = mem;
+			vy_mem_ref(mem);
+			rlist_add_tail(history, &terminal_node->link);
+			*terminal_found = true;
+			break;
+		}
+		struct vy_stmt_history_node *node = vy_one_iterator_new_node();
+		if (node == NULL)
+			return -1;
+
+		node->src_type = ITER_SRC_MEM;
+		node->stmt = stmt;
+		node->mem = mem;
+		vy_mem_ref(mem);
+		rlist_add_tail(history, &node->link);
+
+		if (!vy_mem_tree_iterator_next(&mem->tree, &mem_itr))
+			break;
+		itr->index->env->stat->mem_stat.step_count++;
+
+		const struct tuple *prev_stmt = stmt;
+		stmt = *vy_mem_tree_iterator_get_elem(&mem->tree, &mem_itr);
+		if (vy_stmt_lsn(stmt) >= vy_stmt_lsn(prev_stmt))
+			break;
+		if (vy_stmt_compare(stmt, itr->key, mem->key_def) != 0)
+			break;
+	}
+	return 0;
+
+}
+
+/**
+ * Scan all mems that belongs to index.
+ */
+static int
+vy_one_iterator_scan_mems(struct vy_one_iterator *itr,
+			  struct rlist *history,
+			  struct vy_stmt_history_node *terminal_node,
+			  bool *terminal_found, bool *prev_history_reached,
+			  bool *track_latest,
+			  int64_t got_history_lsn)
+{
+	assert(itr->index->mem != NULL);
+	int rc = vy_one_iterator_scan_mem(itr, itr->index->mem, history,
+					  terminal_node, terminal_found,
+					  prev_history_reached, track_latest,
+					  got_history_lsn);
+	if (rc != 0 || *terminal_found || *prev_history_reached)
+		return rc;
+
+	struct vy_mem *mem;
+	rlist_foreach_entry(mem, &itr->index->sealed, in_sealed) {
+		rc = vy_one_iterator_scan_mem(itr, itr->index->mem, history,
+					      terminal_node, terminal_found,
+					      prev_history_reached,
+					      track_latest, got_history_lsn);
+		if (rc != 0 || *terminal_found || *prev_history_reached)
+			return rc;
+	}
+	return 0;
+}
+
+/**
+ * Scan one particular slice. Collect history of a key.
+ */
+static int
+vy_one_iterator_scan_slice(struct vy_one_iterator *itr, struct vy_slice *slice,
+			   struct rlist *history,
+			   struct vy_stmt_history_node *terminal_node,
+			   bool *terminal_found, bool *prev_history_reached,
+			   bool *track_latest, bool *yield_happened,
+			   int64_t got_history_lsn)
+{
+	if (slice->run->dump_lsn <= got_history_lsn) {
+		*prev_history_reached = true;
+		return 0;
+	}
+
+	int rc = 0;
+	/*
+	 * The format of the statement must be exactly the space
+	 * format with the same identifier to fully match the
+	 * format in vy_mem.
+	 */
+	struct tuple_format *format =
+		(itr->index->space_index_count == 1 ?
+		 itr->index->space_format : itr->index->surrogate_format);
+	struct vy_env *env = itr->index->env;
+	struct vy_run_iterator run_itr;
+	const struct vy_read_view **p_read_view;
+	if (*track_latest && rlist_empty(history)) {
+		/* We have to scan all versions in order to clear
+		 * track_latest flag if necessary */
+		p_read_view = &itr->index->env->xm->p_global_read_view;
+	} else {
+		p_read_view = itr->p_read_view;
+	}
+	vy_run_iterator_open(&run_itr, true, &env->stat->run_stat,
+			     &env->run_env, slice,
+			     ITER_EQ, itr->key, p_read_view,
+			     itr->index->key_def, itr->index->user_key_def,
+			     format, itr->index->upsert_format,
+			     itr->index->id == 0);
+	while (true) {
+		struct tuple *stmt;
+		rc = run_itr.base.iface->next_lsn(&run_itr.base, &stmt);
+		*yield_happened = true;
+		if (rc != 0)
+			break;
+		if (stmt == NULL)
+			break;
+		if (vy_stmt_lsn(stmt) <= got_history_lsn) {
+			*prev_history_reached = true;
+			break;
+		}
+		if (vy_stmt_lsn(stmt) > (*itr->p_read_view)->vlsn) {
+			*track_latest = false;
+			continue;
+		}
+
+		if (vy_stmt_type(stmt) != IPROTO_UPSERT) {
+			vy_one_iterator_destroy_node(terminal_node);
+			terminal_node->src_type = ITER_SRC_RUN;
+			terminal_node->refable_stmt = stmt;
+			tuple_ref(stmt);
+			rlist_add_tail(history, &terminal_node->link);
+			*terminal_found = true;
+			break;
+		}
+
+		struct vy_stmt_history_node *node = vy_one_iterator_new_node();
+		if (node == NULL) {
+			rc = -1;
+			break;
+		}
+
+		node->src_type = ITER_SRC_RUN;
+		node->refable_stmt = stmt;
+		tuple_ref(stmt);
+		rlist_add_tail(history, &node->link);
+	}
+	run_itr.base.iface->cleanup(&run_itr.base);
+	run_itr.base.iface->close(&run_itr.base);
+	return rc;
+}
+
+/**
+ * Find a range and scan all slices that belongs to the range.
+ *
+ * All slices are referenced before first slice scan, so it's guaranteed
+ * that complete history from runs will be extracted.
+ */
+static int
+vy_one_iterator_scan_slices(struct vy_one_iterator *itr,
+			    struct rlist *history,
+			    struct vy_stmt_history_node *terminal_node,
+			    bool *terminal_found, bool *prev_history_reached,
+			    bool *track_latest, bool *yield_happened,
+			    int64_t got_history_lsn,
+			    int64_t *slices_history_lsn)
+{
+	*slices_history_lsn = 0;
+	struct vy_range *range =
+		vy_range_tree_find_by_key(itr->index->tree, ITER_EQ,
+					  itr->key, itr->index->key_def);
+	assert(range != NULL);
+	int slice_count = range->slice_count;
+	struct vy_slice **slices = (struct vy_slice **)
+		region_alloc(&fiber()->gc, slice_count * sizeof(*slices));
+	if (slices == NULL) {
+		diag_set(OutOfMemory, slice_count * sizeof(*slices),
+			 "region", "slices array");
+		return -1;
+	}
+	int i = 0;
+	struct vy_slice *slice;
+	rlist_foreach_entry(slice, &range->slices, in_range) {
+		if (*slices_history_lsn == 0)
+			*slices_history_lsn = slice->run->dump_lsn;
+		vy_slice_ref(slice);
+		slices[i++] = slice;
+	}
+	assert(i == slice_count);
+	int rc = 0;
+	for (i = 0; i < slice_count; i++) {
+		if (rc == 0 && !*terminal_found && !*prev_history_reached)
+			rc = vy_one_iterator_scan_slice(itr, slices[i], history,
+							terminal_node,
+							terminal_found,
+							prev_history_reached,
+							track_latest,
+							yield_happened,
+							got_history_lsn);
+		vy_slice_unref(slices[i]);
+	}
+	return rc;
+}
+
+/**
+ * Check collected history after yield:
+ * - Remove statements that were rollbacked.
+ * - Remove mem statements that from mem that were removed
+ *   (and history before them as well).
+ * - Remove statements that became invisible due to sending to read view.
+ */
+static void
+vy_one_iterator_verify_history(struct rlist *history, int64_t vlsn)
+{
+	struct vy_stmt_history_node *node, *tmp;
+	rlist_foreach_entry_safe(node, history, link, tmp) {
+		assert(node->src_type == ITER_SRC_MEM ||
+		       node->src_type == ITER_SRC_RUN);
+		if (node->src_type == ITER_SRC_MEM && node->mem->is_zombie) {
+			/* If a mem has gone to zombie, all statements from
+			 * it are lost. Remove also younger history,
+			 * because the history from mems are to be rescanned */
+			struct vy_stmt_history_node *n, *t;
+			rlist_foreach_entry_safe(n, history, link, t) {
+				vy_one_iterator_destroy_node(n);
+				if (n == node)
+					break;
+			}
+		} else if (vy_stmt_lsn(node->stmt) == 0) {
+			/* The statement was rollbacked during yield
+			 * (during rollback statement's lsn is set to 0). */
+			vy_one_iterator_destroy_node(node);
+		} else if (vy_stmt_lsn(node->stmt) > vlsn) {
+			/* We were sent to read view during yield  */
+			vy_one_iterator_destroy_node(node);
+		} else if (node->src_type == ITER_SRC_RUN) {
+			/* Statements from runs are permanent history */
+			break;
+		}
+	}
+}
+
+/**
+ * Get a resultant statement from collected history. Add to cache if possible.
+ */
+static int
+vy_one_iterator_apply_history(struct vy_one_iterator *itr,
+			      struct rlist *history,
+			      struct vy_stmt_history_node *terminal_node,
+			      bool track_latest, struct tuple **result)
+{
+	if (rlist_empty(history))
+		return 0;
+	bool add_to_cache = track_latest ||
+			    (*itr->p_read_view)->vlsn ==
+			    itr->index->env->xm->p_global_read_view->vlsn;
+	if (terminal_node->src_type == ITER_SRC_TXW ||
+	    terminal_node->src_type == ITER_SRC_CACHE)
+		add_to_cache = false;
+
+	struct vy_stmt_history_node *node;
+	const struct tuple *terminal = NULL;
+	if (terminal_node->src_type == ITER_SRC_NONE) {
+		node = rlist_last_entry(history,
+					struct vy_stmt_history_node, link);
+	} else {
+		terminal = terminal_node->stmt;
+		node = rlist_prev_entry_safe(terminal_node, history, link);
+	}
+
+	while (node != NULL) {
+		assert(vy_stmt_type(node->stmt) == IPROTO_UPSERT);
+
+		if (node->src_type == ITER_SRC_TXW && add_to_cache) {
+			/* It's time to add to cache */
+			if (*result == NULL && terminal != NULL &&
+			    vy_stmt_type(terminal) != IPROTO_DELETE) {
+				if (terminal_node->src_type == ITER_SRC_MEM) {
+					*result = vy_stmt_dup(terminal,
+							      tuple_format(terminal));
+					if (*result == NULL)
+						return -1;
+				} else {
+					*result = terminal_node->refable_stmt;
+					tuple_ref(*result);
+				}
+			}
+			vy_cache_add(&itr->index->cache, *result, NULL,
+				     itr->key, ITER_EQ);
+			add_to_cache = false;
+		}
+
+		struct tuple *stmt =
+			vy_apply_upsert(node->stmt,
+					*result ? *result : terminal,
+					itr->index->key_def,
+					itr->index->space_format,
+					itr->index->upsert_format, true);
+		rmean_collect(itr->index->env->stat->rmean,
+			      VY_STAT_UPSERT_APPLIED, 1);
+		if (stmt == NULL)
+			return -1;
+		if (*result)
+			tuple_unref(*result);
+		*result = stmt;
+		node = rlist_prev_entry_safe(node, history, link);
+	}
+	if (*result == NULL && terminal != NULL &&
+	    vy_stmt_type(terminal) != IPROTO_DELETE) {
+		if (terminal_node->src_type == ITER_SRC_MEM) {
+			*result = vy_stmt_dup(terminal, tuple_format(terminal));
+			if (*result == NULL)
+				return -1;
+		} else {
+			*result = terminal_node->refable_stmt;
+			tuple_ref(*result);
+		}
+	}
+	if (*result)
+		itr->curr_stmt = *result;
+	if (add_to_cache)
+		vy_cache_add(&itr->index->cache, *result, NULL,
+			     itr->key, ITER_EQ);
+	return 0;
+}
+
+/*
+ * Get a resultant tuple from the iterator. Actually do not change
+ * iterator state thus second call will return the same statement
+ * (unlike all other iterators that would return NULL on the second call)
+ */
+static int
+vy_one_iterator_get(struct vy_one_iterator *itr, struct tuple **result)
+{
+	*result = NULL;
+	struct region *region = &fiber()->gc;
+	size_t region_svp = region_used(region);
+	int rc = 0;
+
+	/* Full history list */
+	struct rlist history = RLIST_HEAD_INITIALIZER(history);
+	/* History list that was collected during one round of scanning */
+	struct rlist new_history = RLIST_HEAD_INITIALIZER(new_history);
+	/* Preallocated history node for txw */
+	struct vy_stmt_history_node txw_history_node;
+	txw_history_node.src_type = ITER_SRC_NONE;
+	/* Preallocated history node for terminal (replace/delete) statement */
+	struct vy_stmt_history_node terminal_node;
+	terminal_node.src_type = ITER_SRC_NONE;
+	/* Is set when a terminal statement is met during scanning */
+	bool terminal_found = false;
+
+	/**
+	 *  The flag is set when it is necessary to determine whether we have
+	 * read the newer data or not. For example
+	 *  If scanning process meets at least one tuple with given key but
+	 * invisible due to read view limitations, the flag is cleared.
+	 *  If the flag is still set after scanning that means that we can
+	 * add the resultant tuple to cache in spite of given read view.
+	 */
+	bool track_latest;
+	/**
+	 *  Once history is collected, the greatest lsn of its statements is
+	 * saved here for further filtering in (potential) next scan round.
+	 */
+	int64_t got_history_lsn = 0;
+
+
+	vy_one_iterator_scan_txw(itr, &history, &txw_history_node,
+				 &terminal_node, &terminal_found);
+	if (terminal_found)
+		goto done;
+
+	vy_one_iterator_scan_cache(itr, &history, &terminal_node,
+				   &terminal_found);
+	if (terminal_found)
+		goto done;
+
+	while (true) {
+		/*
+		 * Track for skipped (lsn > vlsn) tuples. Once a tuple
+		 * was skipped it becomes clear that the result is not
+		 * the latest version of the key and must not be placed
+		 * into cache.
+		 *
+		 * Do not track for skipped in global read view, there's no one.
+		 */
+		track_latest = (*itr->p_read_view)->vlsn !=
+			       itr->index->env->xm->p_global_read_view->vlsn;
+		/**
+		 * In every round we should stop scanning if we have met
+		 * terminal statement.
+		 */
+		terminal_found = false;
+		/**
+		 * During slice reading the wirking fiber may yield. That
+		 * means that a part of collected history can be invalidated
+		 * and/or must be appended with newer history.
+		 */
+		bool yield_happened = false;
+		/**
+		 * In the second round of scanning the flag is set if previous
+		 * history was reached. The flag actually means that scan round
+		 * is finished.
+		 */
+		bool prev_history_reached = false;
+
+		rc = vy_one_iterator_scan_mems(itr, &history, &terminal_node,
+					       &terminal_found,
+					       &prev_history_reached,
+					       &track_latest, got_history_lsn);
+		if (rc != 0)
+			goto error;
+
+		if (terminal_found || prev_history_reached)
+			break;
+
+		/* The history that we will certanly get in this round */
+		int64_t slices_history_lsn = 0;
+		rc = vy_one_iterator_scan_slices(itr, &history, &terminal_node,
+						 &terminal_found,
+						 &prev_history_reached,
+						 &track_latest, &yield_happened,
+						 got_history_lsn,
+						 &slices_history_lsn);
+		if (rc != 0)
+			goto error;
+
+		if (!yield_happened)
+			break;
+
+		rlist_splice(&history, &new_history);
+		vy_one_iterator_verify_history(&history,
+					       (*itr->p_read_view)->vlsn);
+		got_history_lsn = slices_history_lsn;
+		if (!rlist_empty(&history)) {
+			const struct tuple *stmt =
+				rlist_first_entry(&history,
+						  struct vy_stmt_history_node,
+						  link)->stmt;
+			if (vy_stmt_lsn(stmt) > got_history_lsn)
+				got_history_lsn = vy_stmt_lsn(stmt);
+		}
+	}
+done:
+	rlist_splice(&history, &new_history);
+	if (txw_history_node.src_type != ITER_SRC_NONE)
+		rlist_add(&history, &txw_history_node.link);
+	rc = vy_one_iterator_apply_history(itr, &history, &terminal_node,
+					   track_latest, result);
+error:
+	rlist_splice(&history, &new_history);
+	struct vy_stmt_history_node *node, *tmp;
+	rlist_foreach_entry_safe(node, &history, link, tmp)
+		vy_one_iterator_destroy_node(node);
+	region_truncate(region, region_svp);
+	return rc;
+}
+
 static void
 vy_read_iterator_add_tx(struct vy_read_iterator *itr)
 {
@@ -7774,6 +8475,36 @@ restart:
 static NODISCARD int
 vy_read_iterator_next(struct vy_read_iterator *itr, struct tuple **result)
 {
+	/* The key might be set to NULL during previous call, that means
+	 * that there's no more data */
+	if (itr->key == NULL) {
+		*result = NULL;
+		return 0;
+	}
+	bool one_value = false;
+	if (itr->iterator_type == ITER_EQ) {
+		if (itr->index->opts.is_unique)
+			one_value = tuple_field_count(itr->key) >=
+				    itr->index->user_key_def->part_count;
+		else
+			one_value = tuple_field_count(itr->key) >=
+				    itr->index->key_def->part_count;
+	}
+	/* Run a special iterator for a special case */
+	if (one_value) {
+		struct vy_one_iterator one;
+		vy_one_iterator_open(&one, itr->index, itr->tx,
+				     itr->read_view, itr->key);
+		int rc = vy_one_iterator_get(&one, result);
+		if (*result) {
+			tuple_ref(*result);
+			itr->curr_stmt = *result;
+		}
+		vy_one_iterator_close(&one);
+		itr->key = NULL;
+		return rc;
+	}
+
 	*result = NULL;
 
 	if (!itr->search_started)
