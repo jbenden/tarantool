@@ -91,6 +91,8 @@ vy_mem_new(struct lsregion *allocator, int64_t generation,
 	rlist_create(&index->in_dump_fifo);
 	index->pin_count = 0;
 	ipc_cond_create(&index->pin_cond);
+	index->refs = 1;
+	index->is_zombie = false;
 	return index;
 }
 
@@ -114,6 +116,7 @@ vy_mem_update_formats(struct vy_mem *mem, struct tuple_format *new_format,
 void
 vy_mem_delete(struct vy_mem *index)
 {
+	assert(index->refs == 0);
 	tuple_format_ref(index->format, -1);
 	tuple_format_ref(index->format_with_colmask, -1);
 	tuple_format_ref(index->upsert_format, -1);

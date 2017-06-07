@@ -35,6 +35,7 @@
 #include <stdbool.h>
 
 #include <small/rlist.h>
+#include <fiber.h>
 
 #include "ipc.h"
 #include "index.h" /* enum iterator_type */
@@ -179,6 +180,13 @@ struct vy_mem {
 	 * if pin_count reaches 0.
 	 */
 	struct ipc_cond pin_cond;
+	/**
+	 * Mem reference counter, the mem is deleted once it hits 0.
+	 * A new mem is created with the reference counter set to 1.
+	 */
+	int refs;
+	/** Is true when the mem is unusable - all containing data was freed */
+	bool is_zombie;
 };
 
 /**
@@ -241,6 +249,23 @@ vy_mem_new(struct lsregion *allocator, int64_t generation,
  */
 void
 vy_mem_delete(struct vy_mem *index);
+
+static inline void
+vy_mem_ref(struct vy_mem *mem)
+{
+	assert(mem->refs > 0);
+	assert(cord_is_main());
+	mem->refs++;
+}
+
+static inline void
+vy_mem_unref(struct vy_mem *mem)
+{
+	assert(mem->refs > 0);
+	assert(cord_is_main());
+	if (--mem->refs == 0)
+		vy_mem_delete(mem);
+}
 
 /*
  * Return the older statement for the given one.

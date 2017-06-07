@@ -105,7 +105,7 @@ test_basic(void)
 	is(mem->version, 6, "vy_mem->version")
 
 	/* Clean up */
-	vy_mem_delete(mem);
+	vy_mem_unref(mem);
 	lsregion_destroy(&lsregion);
 	box_key_def_delete(key_def);
 

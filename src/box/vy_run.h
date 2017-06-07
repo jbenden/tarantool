@@ -38,6 +38,7 @@
 #include "index.h" /* enum iterator_type */
 #include "vy_stmt.h" /* for comparators */
 #include "vy_stmt_iterator.h" /* struct vy_stmt_iterator */
+#include "fiber.h" /* cord_is_main() */
 
 #include "small/mempool.h"
 #include "salad/bloom.h"
@@ -184,6 +185,11 @@ struct vy_slice {
 	uint32_t keys;
 	/** An estimate of the size of this slice on disk. */
 	uint64_t size;
+	/**
+	 * Slice reference counter, the slice is deleted once it hits 0.
+	 * A new slice is created with the reference counter set to 1.
+	 */
+	int refs;
 };
 
 /** Position of a particular stmt in vy_run. */
@@ -319,6 +325,7 @@ static inline void
 vy_run_ref(struct vy_run *run)
 {
 	assert(run->refs > 0);
+	assert(cord_is_main());
 	run->refs++;
 }
 
@@ -326,6 +333,7 @@ static inline void
 vy_run_unref(struct vy_run *run)
 {
 	assert(run->refs > 0);
+	assert(cord_is_main());
 	if (--run->refs == 0)
 		vy_run_delete(run);
 }
@@ -396,6 +404,23 @@ vy_slice_new(int64_t id, struct vy_run *run,
  */
 void
 vy_slice_delete(struct vy_slice *slice);
+
+static inline void
+vy_slice_ref(struct vy_slice *slice)
+{
+	assert(slice->refs > 0);
+	assert(cord_is_main());
+	slice->refs++;
+}
+
+static inline void
+vy_slice_unref(struct vy_slice *slice)
+{
+	assert(slice->refs > 0);
+	assert(cord_is_main());
+	if (--slice->refs == 0)
+		vy_slice_delete(slice);
+}
 
 /**
  * Pin a run slice.

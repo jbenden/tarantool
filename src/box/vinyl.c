@@ -1833,7 +1833,7 @@ vy_range_delete(struct vy_range *range)
 	while (!rlist_empty(&range->slices)) {
 		struct vy_slice *slice = rlist_shift_entry(&range->slices,
 						struct vy_slice, in_range);
-		vy_slice_delete(slice);
+		vy_slice_unref(slice);
 	}
 
 	TRASH(range);
@@ -3127,7 +3127,7 @@ delete_mems:
 		index->mem_used -= mem->used;
 		index->stmt_count -= mem->tree.size;
 		vy_scheduler_remove_mem(scheduler, mem);
-		vy_mem_delete(mem);
+		vy_mem_unref(mem);
 	}
 	index->version++;
 	index->dump_lsn = dump_lsn;
@@ -3147,7 +3147,7 @@ fail_free_slices:
 	for (i = 0; i < index->range_count; i++) {
 		slice = new_slices[i];
 		if (slice != NULL)
-			vy_slice_delete(slice);
+			vy_slice_unref(slice);
 		if (++loops % VY_YIELD_LOOPS == 0)
 			fiber_sleep(0);
 	}
@@ -3234,7 +3234,7 @@ vy_task_dump_new(struct vy_index *index, struct vy_task **p_task)
 			index->mem_used -= mem->used;
 			rlist_del_entry(mem, in_sealed);
 			vy_scheduler_remove_mem(scheduler, mem);
-			vy_mem_delete(mem);
+			vy_mem_unref(mem);
 			continue;
 		}
 		dump_lsn = MAX(dump_lsn, mem->max_lsn);
@@ -3391,7 +3391,7 @@ vy_task_compact_complete(struct vy_task *task)
 	}
 	if (vy_log_tx_commit() < 0) {
 		if (new_slice != NULL)
-			vy_slice_delete(new_slice);
+			vy_slice_unref(new_slice);
 		return -1;
 	}
 
@@ -3438,7 +3438,7 @@ vy_task_compact_complete(struct vy_task *task)
 	rlist_foreach_entry_safe(slice, &compacted_slices,
 				 in_range, next_slice) {
 		vy_slice_wait_pinned(slice);
-		vy_slice_delete(slice);
+		vy_slice_unref(slice);
 	}
 
 	/* The iterator has been cleaned up in worker. */
@@ -4170,6 +4170,11 @@ vy_scheduler_remove_mem(struct vy_scheduler *scheduler, struct vy_mem *mem)
 	struct vy_quota *quota = &scheduler->env->quota;
 	size_t mem_used_before = lsregion_used(allocator);
 	lsregion_gc(allocator, scheduler->generation - 1);
+	/*
+	 * Mark the mem as zombie to notify other readers
+	 * that mem's data was gone.
+	 */
+	mem->is_zombie = true;
 	size_t mem_used_after = lsregion_used(allocator);
 	assert(mem_used_after <= mem_used_before);
 	vy_quota_release(quota, mem_used_before - mem_used_after);
@@ -5048,12 +5053,12 @@ vy_index_delete(struct vy_index *index)
 	/* Delete all in-memory trees. */
 	assert(index->mem != NULL);
 	vy_scheduler_remove_mem(scheduler, index->mem);
-	vy_mem_delete(index->mem);
+	vy_mem_unref(index->mem);
 	while (!rlist_empty(&index->sealed)) {
 		struct vy_mem *mem = rlist_shift_entry(&index->sealed,
 						struct vy_mem, in_sealed);
 		vy_scheduler_remove_mem(scheduler, mem);
-		vy_mem_delete(mem);
+		vy_mem_unref(mem);
 	}
 
 	read_set_iter(&index->read_set, NULL, read_set_delete_cb, NULL);
@@ -7999,7 +8004,7 @@ vy_send_range(struct vy_join_ctx *ctx)
 
 	struct vy_slice *tmp;
 	rlist_foreach_entry_safe(slice, &ctx->slices, in_join, tmp)
-		vy_slice_delete(slice);
+		vy_slice_unref(slice);
 	rlist_create(&ctx->slices);
 
 out_delete_wi:
@@ -8166,7 +8171,7 @@ vy_join(struct vy_env *env, struct vclock *vclock, struct xstream *stream)
 		tuple_format_ref(ctx->upsert_format, -1);
 	struct vy_slice *slice, *tmp;
 	rlist_foreach_entry_safe(slice, &ctx->slices, in_join, tmp)
-		vy_slice_delete(slice);
+		vy_slice_unref(slice);
 out_join_cord:
 	cbus_stop_loop(&ctx->relay_pipe);
 	cpipe_destroy(&ctx->relay_pipe);

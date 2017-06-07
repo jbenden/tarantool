@@ -32,7 +32,6 @@
 
 #include <zstd.h>
 
-#include "fiber.h"
 #include "fio.h"
 #include "ipc.h"
 #include "cbus.h"
@@ -393,12 +392,14 @@ vy_slice_new(int64_t id, struct vy_run *run,
 				   run->info.count);
 	slice->size = DIV_ROUND_UP(run->info.size * count,
 				   run->info.count);
+	slice->refs = 1;
 	return slice;
 }
 
 void
 vy_slice_delete(struct vy_slice *slice)
 {
+	assert(slice->refs == 0);
 	assert(slice->pin_count == 0);
 	vy_run_unref(slice->run);
 	if (slice->begin != NULL)
