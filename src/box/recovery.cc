@@ -246,6 +246,8 @@ void
 recover_remaining_wals(struct recovery *r, struct xstream *stream,
 		       struct vclock *stop_vclock)
 {
+	int cmp;
+
 	/*
 	 * Sic: it could be tempting to put xdir_scan() inside
 	 * this function. This would slow down relay quite a bit,
@@ -289,7 +291,17 @@ recover_remaining_wals(struct recovery *r, struct xstream *stream,
 			break;
 		}
 
-		if (vclock_compare(clock, &r->vclock) > 0) {
+		cmp = vclock_compare(clock, &r->vclock);
+		if (r->eof && cmp < 0) {
+			/*
+			 * If EOF was reached while reading the
+			 * last xlog, the next xlog should have
+			 * clock equal to @vclock.
+			 */
+			continue;
+		}
+
+		if (cmp > 0) {
 			/**
 			 * The best clock we could find is
 			 * greater or is incomparable with the
@@ -307,18 +319,18 @@ recover_remaining_wals(struct recovery *r, struct xstream *stream,
 		recovery_close_log(r);
 
 		xdir_open_cursor_xc(&r->wal_dir, vclock_sum(clock), &r->cursor);
+		r->eof = false;
 
 		say_info("recover from `%s'", r->cursor.name);
 
 recover_current_wal:
 		if (r->cursor.state != XLOG_CURSOR_EOF)
 			recover_xlog(r, stream, stop_vclock);
-		/**
-		 * Keep the last log open to remember recovery
-		 * position. This speeds up recovery in local hot
-		 * standby mode, since we don't have to re-open
-		 * and re-scan the last log in recovery_finalize().
-		 */
+
+		if (r->cursor.state == XLOG_CURSOR_EOF) {
+			recovery_close_log(r);
+			r->eof = true;
+		}
 	}
 
 	if (stop_vclock != NULL && vclock_compare(&r->vclock, stop_vclock) != 0)
@@ -489,29 +501,24 @@ recovery_follow_f(va_list ap)
 		 */
 		int64_t start, end;
 		do {
-			start = r->cursor.state != XLOG_CURSOR_CLOSED ?
-				vclock_sum(&r->cursor.meta.vclock) : 0;
+			start = vclock_sum(&r->vclock);
 			/*
 			 * If there is no current WAL, or we reached
 			 * an end  of one, look for new WALs.
 			 */
-			if (r->cursor.state == XLOG_CURSOR_CLOSED
-			    || r->cursor.state == XLOG_CURSOR_EOF)
+			if (r->cursor.state == XLOG_CURSOR_CLOSED)
 				xdir_scan_xc(&r->wal_dir);
 
 			recover_remaining_wals(r, stream, NULL);
 
-			end = r->cursor.state != XLOG_CURSOR_CLOSED ?
-			      vclock_sum(&r->cursor.meta.vclock) : 0;
+			end = vclock_sum(&r->vclock);
 			/*
 			 * Continue, given there's been progress *and* there is a
 			 * chance new WALs have appeared since.
 			 * Sic: end * is < start (is 0) if someone deleted all logs
 			 * on the filesystem.
 			 */
-		} while (end > start &&
-			 (r->cursor.state == XLOG_CURSOR_CLOSED ||
-			  r->cursor.state == XLOG_CURSOR_EOF));
+		} while (end > start && r->cursor.state == XLOG_CURSOR_CLOSED);
 
 		subscription.set_log_path(r->cursor.state != XLOG_CURSOR_CLOSED ?
 					  r->cursor.name: NULL);

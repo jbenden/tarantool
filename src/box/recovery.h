@@ -49,6 +49,12 @@ struct recovery {
 	struct xlog_cursor cursor;
 	struct xdir wal_dir;
 	/**
+	 * This flag is set if @cursor was closed by EOF.
+	 * In this case the next xlog should have clock
+	 * equal to @vclock.
+	 */
+	bool eof;
+	/**
 	 * This is used in local hot standby or replication
 	 * relay mode: look for changes in the wal_dir and apply them
 	 * locally or send to the replica.
