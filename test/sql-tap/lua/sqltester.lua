@@ -300,23 +300,28 @@ local function db(self, cmd, ...)
 end
 test.db = db
 
+-- returns first occurance of seed in input or -1
 local function lsearch(self, input, seed)
-    local result = 0
-
+    local index = 1
+    local success = false
     local function search(arr)
         if type(arr) == 'table' then
             for _, v in ipairs(arr) do
                 search(v)
+                if success == true then
+                    return
+                end
             end
         else
             if type(arr) == 'string' and arr:find(seed) ~= nil then
-                result = result + 1
+                success = true
+            else
+                index = index + 1
             end
         end
     end
-
     search(input)
-    return result
+    return success == true and index or -1
 end
 test.lsearch = lsearch
 
