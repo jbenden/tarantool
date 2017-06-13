@@ -55,11 +55,6 @@ struct vy_write_src {
 	/* Current tuple in the source (lowest and with maximal lsn) */
 	struct tuple *tuple;
 	/**
-	 * Is the tuple (@sa tuple) refable or not.
-	 * Tuples from mems are reafble, from runs - not
-	 */
-	bool is_tuple_refable;
-	/**
 	 * There are special rules of comparison for virtual sources
 	 * that represent a delimiter between the current key and
 	 * the next key. They must be after (greater than) the sources with
@@ -79,8 +74,6 @@ struct vy_write_src {
 struct vy_read_view_stmt {
 	/** Key version. */
 	struct tuple *stmt;
-	/** True, if @stmt can be referenced. */
-	bool is_tuple_refable;
 	/** Read view LSN. */
 	int64_t vlsn;
 };
@@ -173,11 +166,10 @@ heap_less(heap_t *heap, struct heap_node *node1, struct heap_node *node2)
  * Allocate a source and put it to the list.
  * The underlying stream (src->stream) must be opened immediately.
  * @param stream - the write iterator.
- * @param is_tuple_refable - true for runs and false for mems.
  * @return the source or NULL on memory error.
  */
 static struct vy_write_src *
-vy_write_iterator_new_src(struct vy_write_iterator *stream, bool is_tuple_refable)
+vy_write_iterator_new_src(struct vy_write_iterator *stream)
 {
 	struct vy_write_src *res = (struct vy_write_src *) malloc(sizeof(*res));
 	if (res == NULL) {
@@ -185,7 +177,6 @@ vy_write_iterator_new_src(struct vy_write_iterator *stream, bool is_tuple_refabl
 			 "malloc", "write stream src");
 		return NULL;
 	}
-	res->is_tuple_refable = is_tuple_refable;
 	res->is_end_of_key = false;
 	rlist_add(&stream->src_list, &res->in_src_list);
 	return res;
@@ -327,8 +318,7 @@ vy_write_iterator_stop(struct vy_stmt_stream *vstream)
 	struct vy_write_iterator *stream = (struct vy_write_iterator *)vstream;
 	for (int i = 0; i < stream->rv_count; ++i) {
 		struct vy_read_view_stmt *rv = &stream->read_views[i];
-		if (rv->is_tuple_refable && rv->stmt != NULL)
-			tuple_unref(rv->stmt);
+		vy_stmt_unref_if_possible(rv->stmt);
 	}
 	struct vy_write_src *src, *tmp;
 	rlist_foreach_entry_safe(src, &stream->src_list, in_src_list, tmp)
@@ -357,7 +347,7 @@ NODISCARD int
 vy_write_iterator_add_mem(struct vy_stmt_stream *vstream, struct vy_mem *mem)
 {
 	struct vy_write_iterator *stream = (struct vy_write_iterator *)vstream;
-	struct vy_write_src *src = vy_write_iterator_new_src(stream, false);
+	struct vy_write_src *src = vy_write_iterator_new_src(stream);
 	if (src == NULL)
 		return -1;
 	vy_mem_stream_open(&src->mem_stream, mem);
@@ -373,7 +363,7 @@ vy_write_iterator_add_slice(struct vy_stmt_stream *vstream,
 			    struct vy_slice *slice, struct vy_run_env *run_env)
 {
 	struct vy_write_iterator *stream = (struct vy_write_iterator *)vstream;
-	struct vy_write_src *src = vy_write_iterator_new_src(stream, true);
+	struct vy_write_src *src = vy_write_iterator_new_src(stream);
 	if (src == NULL)
 		return -1;
 	vy_slice_stream_open(&src->slice_stream, slice, stream->key_def,
@@ -427,21 +417,17 @@ vy_get_read_view_lsn(struct vy_write_iterator *stream, int current_rv_i)
  * specified number.
  * @param stream Write iterator.
  * @param tuple Key version.
- * @param is_tuple_refable True, if @tuple can be referenced.
  * @param current_rv_i Number of the current read view.
  */
 static inline void
 vy_write_iterator_add_read_view_stmt(struct vy_write_iterator *stream,
-				     struct tuple *tuple, bool is_tuple_refable,
-				     int current_rv_i)
+				     struct tuple *tuple, int current_rv_i)
 {
 	assert(current_rv_i < stream->rv_count);
 	struct vy_read_view_stmt *rv = &stream->read_views[current_rv_i];
 	assert(rv->stmt == NULL);
 	rv->stmt = tuple;
-	rv->is_tuple_refable = is_tuple_refable;
-	if (is_tuple_refable)
-		tuple_ref(tuple);
+	vy_stmt_ref_if_possible(tuple);
 	assert(rv->vlsn >= vy_stmt_lsn(tuple));
 }
 
@@ -464,8 +450,7 @@ vy_write_iterator_pop_read_view_stmt(struct vy_write_iterator *stream)
 	if (stream->stmt_i > 0) {
 		/* Unref the previous. */
 		rv = &stream->read_views[stream->stmt_i - 1];
-		if (rv->is_tuple_refable && rv->stmt != NULL)
-			tuple_unref(rv->stmt);
+		vy_stmt_unref_if_possible(rv->stmt);
 		rv->stmt = NULL;
 	}
 next_version:
@@ -513,8 +498,7 @@ vy_write_iterator_next_key(struct vy_write_iterator *stream, int *count)
 	struct vy_write_src end_of_key_src;
 	end_of_key_src.is_end_of_key = true;
 	end_of_key_src.tuple = src->tuple;
-	end_of_key_src.is_tuple_refable = src->is_tuple_refable;
-	if (src->is_tuple_refable)
+	if (vy_stmt_is_refable(src->tuple))
 		tuple_ref(src->tuple);
 	int rc = src_heap_insert(&stream->src_heap, &end_of_key_src.heap_node);
 	if (rc) {
@@ -533,7 +517,6 @@ vy_write_iterator_next_key(struct vy_write_iterator *stream, int *count)
 	uint64_t key_mask = stream->key_def->column_mask;
 	/* Merged sequence of upserts. */
 	struct tuple *upserts_seq = NULL;
-	bool is_upserts_seq_refable = false;
 
 	while (true) {
 		/*
@@ -558,10 +541,9 @@ vy_write_iterator_next_key(struct vy_write_iterator *stream, int *count)
 			if (upserts_seq != NULL) {
 				vy_write_iterator_add_read_view_stmt(stream,
 								     upserts_seq,
-								     is_upserts_seq_refable,
 								     current_rv_i);
 				++*count;
-				if (is_upserts_seq_refable)
+				if (vy_stmt_is_refable(upserts_seq))
 					tuple_unref(upserts_seq);
 				upserts_seq = NULL;
 			}
@@ -615,7 +597,7 @@ vy_write_iterator_next_key(struct vy_write_iterator *stream, int *count)
 							stream->format,
 							stream->upsert_format,
 							false);
-				if (is_upserts_seq_refable)
+				if (vy_stmt_is_refable(upserts_seq))
 					tuple_unref(upserts_seq);
 				upserts_seq = NULL;
 				if (applied == NULL) {
@@ -624,13 +606,11 @@ vy_write_iterator_next_key(struct vy_write_iterator *stream, int *count)
 				}
 				vy_write_iterator_add_read_view_stmt(stream,
 								     applied,
-								     true,
 								     current_rv_i);
 				tuple_unref(applied);
 			} else {
 				vy_write_iterator_add_read_view_stmt(stream,
 								     src->tuple,
-								     src->is_tuple_refable,
 								     current_rv_i);
 			}
 			++*count;
@@ -648,8 +628,7 @@ vy_write_iterator_next_key(struct vy_write_iterator *stream, int *count)
 		 */
 		if (upserts_seq == NULL) {
 			upserts_seq = src->tuple;
-			is_upserts_seq_refable = src->is_tuple_refable;
-			if (is_upserts_seq_refable)
+			if (vy_stmt_is_refable(upserts_seq))
 				tuple_ref(upserts_seq);
 		} else {
 			/*
@@ -662,14 +641,13 @@ vy_write_iterator_next_key(struct vy_write_iterator *stream, int *count)
 				vy_apply_upsert(upserts_seq, src->tuple,
 						stream->key_def, stream->format,
 						stream->upsert_format, false);
-			if (is_upserts_seq_refable)
+			if (vy_stmt_is_refable(upserts_seq))
 				tuple_unref(upserts_seq);
 			upserts_seq = applied;
 			if (applied == NULL) {
 				rc = -1;
 				break;
 			}
-			is_upserts_seq_refable = true;
 		}
 
 next_step:
@@ -685,9 +663,8 @@ next_step:
 			if (upserts_seq != NULL) {
 				vy_write_iterator_add_read_view_stmt(stream,
 								     upserts_seq,
-								     is_upserts_seq_refable,
 								     current_rv_i);
-				if (is_upserts_seq_refable)
+				if (vy_stmt_is_refable(upserts_seq))
 					tuple_unref(upserts_seq);
 				++*count;
 			}
@@ -696,7 +673,7 @@ next_step:
 	}
 
 	src_heap_delete(&stream->src_heap, &end_of_key_src.heap_node);
-	if (end_of_key_src.is_tuple_refable)
+	if (vy_stmt_is_refable(end_of_key_src.tuple))
 		tuple_unref(end_of_key_src.tuple);
 	return rc;
 }
