@@ -150,7 +150,7 @@ vy_mem_insert(struct vy_mem *mem, const struct tuple *stmt)
 	       stmt->format_id == tuple_format_id(mem->format) ||
 	       stmt->format_id == tuple_format_id(mem->upsert_format));
 	/* The statement must be from a lsregion. */
-	assert(vy_stmt_is_region_allocated(stmt));
+	assert(!vy_stmt_is_refable(stmt));
 	size_t size = tuple_size(stmt);
 	const struct tuple *replaced_stmt = NULL;
 	if (vy_mem_tree_insert(&mem->tree, stmt, &replaced_stmt))
@@ -172,7 +172,7 @@ void
 vy_mem_commit_stmt(struct vy_mem *mem, const struct tuple *stmt)
 {
 	/* The statement must be from a lsregion. */
-	assert(vy_stmt_is_region_allocated(stmt));
+	assert(!vy_stmt_is_refable(stmt));
 	int64_t lsn = vy_stmt_lsn(stmt);
 	if (mem->min_lsn == INT64_MAX)
 		mem->min_lsn = lsn;
@@ -185,7 +185,7 @@ void
 vy_mem_rollback_stmt(struct vy_mem *mem, const struct tuple *stmt)
 {
 	/* This is the statement we've inserted before. */
-	assert(vy_stmt_is_region_allocated(stmt));
+	assert(!vy_stmt_is_refable(stmt));
 	int rc = vy_mem_tree_delete(&mem->tree, stmt);
 	assert(rc == 0);
 	(void) rc;
