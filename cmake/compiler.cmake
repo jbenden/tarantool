@@ -121,37 +121,18 @@ with gcc. If GNU binutils and binutils-dev libraries are installed, backtrace
 is output with resolved function (symbol) names. Otherwise only frame
 addresses are printed." ${CMAKE_COMPILER_IS_GNUCC})
 
-set (HAVE_BFD False)
 if (ENABLE_BACKTRACE)
-    if (NOT ${CMAKE_COMPILER_IS_GNUCC})
-        # We only know this option to work with gcc
-        message (FATAL_ERROR "ENABLE_BACKTRACE option is set but the system
-                is not x86 based (${CMAKE_SYSTEM_PROCESSOR}) or the compiler
-                is not GNU GCC (${CMAKE_C_COMPILER}).")
-    endif()
-    # Use GNU bfd if present.
-    find_library(BFD_LIBRARY NAMES libbfd.a)
-    if(BFD_LIBRARY)
-        check_library_exists (${BFD_LIBRARY} bfd_init ""  HAVE_BFD_LIB)
-    endif()
-    find_library(IBERTY_LIBRARY NAMES libiberty.a)
-    if(IBERTY_LIBRARY)
-        check_library_exists (${IBERTY_LIBRARY} cplus_demangle ""  HAVE_IBERTY_LIB)
-    endif()
+    # unwind is required.
+    find_library(UNWIND_LIBRARY PATH_SUFFIXES system NAMES unwind)
     set(CMAKE_REQUIRED_DEFINITIONS -DPACKAGE=${PACKAGE} -DPACKAGE_VERSION=${PACKAGE_VERSION})
-    check_include_file(bfd.h HAVE_BFD_H)
+    check_include_file(libunwind.h LIBUNWIND_H)
     set(CMAKE_REQUIRED_DEFINITIONS)
-    find_package(ZLIB)
-    if (HAVE_BFD_LIB AND HAVE_BFD_H AND HAVE_IBERTY_LIB AND ZLIB_FOUND)
-        set (HAVE_BFD ON)
-        set (BFD_LIBRARIES ${BFD_LIBRARY} ${IBERTY_LIBRARY} ${ZLIB_LIBRARIES})
-        find_package_message(BFD_LIBRARIES "Found libbfd and dependencies"
-            ${BFD_LIBRARIES})
-        if (TARGET_OS_FREEBSD AND NOT TARGET_OS_DEBIAN_FREEBSD OR
-            TARGET_OS_NETBSD)
-            set (BFD_LIBRARIES ${BFD_LIBRARIES} iconv)
-        endif()
+    set (UNWIND_LIBRARIES ${UNWIND_LIBRARY})
+    if (NOT (UNWIND_LIBRARY AND LIBUNWIND_H))
+        message (FATAL_ERROR "ENABLE_BACKTRACE option is set but unwind "
+                             "library is not found")
     endif()
+    find_package_message(UNWIND_LIBRARIES "Found unwind" ${UNWIND_LIBRARIES})
 endif()
 
 #

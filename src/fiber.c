@@ -90,7 +90,10 @@ static void
 update_last_stack_frame(struct fiber *fiber)
 {
 #ifdef ENABLE_BACKTRACE
-	fiber->last_stack_frame = __builtin_frame_address(0);
+/* arm workaround around register asm variable declaration */
+#define asm __asm__
+	unw_getcontext(&fiber->unw_ctx);
+#undef asm
 #else
 	(void)fiber;
 #endif /* ENABLE_BACKTRACE */
