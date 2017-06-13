@@ -465,6 +465,104 @@ next_version:
 }
 
 /**
+ * Optimization 4.
+ * If in the key version sequence REPLACEs exist older, than
+ * UPSERTs, then UPSERTs can be applied.
+ */
+static void
+vy_write_iterator_replace_upserts(struct vy_write_iterator *stream)
+{
+	/* Only a primary index can contain UPSERTs. */
+	assert(stream->is_primary);
+	struct vy_read_view_stmt *rv =
+		&stream->read_views[stream->rv_count - 1];
+	/* Find first used read view. */
+	while (rv->stmt == NULL) {
+		/*
+		 * Caller must not call optimization, if there are
+		 * no statements.
+		 */
+		assert(rv > &stream->read_views[0]);
+		--rv;
+	}
+	struct tuple *current_version;
+	assert(rv->stmt != NULL);
+	if (vy_stmt_type(rv->stmt) == IPROTO_UPSERT) {
+		/*
+		 * On the last level the oldest UPSERT can be
+		 * turned into REPLACE.
+		 */
+		if (stream->is_last_level) {
+			current_version =
+				vy_stmt_replace_from_upsert(stream->format,
+							    rv->stmt);
+			if (current_version == NULL)
+				/*
+				 * Ignore the error - optimization
+				 * is good, but is no necessary.
+				 */
+				return;
+			if (vy_stmt_is_refable(rv->stmt))
+				tuple_unref(rv->stmt);
+			rv->stmt = current_version;
+			tuple_ref(current_version);
+		} else {
+			current_version = NULL;
+		}
+	} else {
+		current_version = rv->stmt;
+		if (vy_stmt_is_refable(current_version))
+			tuple_ref(current_version);
+	}
+	for (--rv; rv > &stream->read_views[0]; --rv) {
+		/* Skip unused read views. */
+		if (rv->stmt == NULL)
+			continue;
+		/*
+		 * Non-UPSERT statements break applying of the
+		 * current UPSERTs sequence. Start from the
+		 * scratch.
+		 */
+		if (vy_stmt_type(rv->stmt) != IPROTO_UPSERT) {
+			vy_stmt_unref_if_possible(current_version);
+			current_version = rv->stmt;
+			if (vy_stmt_is_refable(current_version))
+				tuple_ref(current_version);
+			continue;
+		}
+		/*
+		 * Opimization is not possible, if there are no
+		 * older non-UPSERT statements.
+		 */
+		if (current_version == NULL)
+			continue;
+		/*
+		 * The read view contains UPSERT and the older
+		 * REPLACE/DELETE statements exist. Apply UPSERT.
+		 */
+		assert(vy_stmt_type(current_version) != IPROTO_UPSERT);
+		struct tuple *applied =
+			vy_apply_upsert(rv->stmt, current_version,
+					stream->key_def, stream->format,
+					stream->upsert_format, false);
+		if (vy_stmt_is_refable(current_version))
+			tuple_unref(current_version);
+		if (applied == NULL)
+			/*
+			 * Ignore the error - optimization is
+			 * good, but is no necessary.
+			 */
+			return;
+		current_version = applied;
+		if (vy_stmt_is_refable(rv->stmt))
+			tuple_unref(rv->stmt);
+		rv->stmt = current_version;
+		tuple_ref(current_version);
+	}
+	vy_stmt_unref_if_possible(current_version);
+}
+
+/**
  * Split the next key in the sequence of the read view statements.
  * @sa struct vy_write_iterator comment for details about
  * algorithm and optimizations.
@@ -675,6 +773,12 @@ next_step:
 	src_heap_delete(&stream->src_heap, &end_of_key_src.heap_node);
 	if (vy_stmt_is_refable(end_of_key_src.tuple))
 		tuple_unref(end_of_key_src.tuple);
+
+	/*
+	 * Optimization 4: apply UPSERTs to older REPLACE/DELETE.
+	 */
+	if (stream->is_primary && *count > 0)
+		vy_write_iterator_replace_upserts(stream);
 	return rc;
 }
 

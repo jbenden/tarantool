@@ -75,7 +75,7 @@ void
 test_basic(void)
 {
 	header();
-	plan(36);
+	plan(48);
 
 	/* Create key_def */
 	uint32_t fields[] = { 0 };
@@ -146,10 +146,12 @@ test_basic(void)
 	int vlsns_count = sizeof(vlsns) / sizeof(vlsns[0]);
 	compare_write_iterator_results(key_def, content, content_count,
 				       expected, expected_count,
-				       vlsns, vlsns_count, true, true);
+				       vlsns, vlsns_count, true, false);
 }
 {
 /*
+ *                            turn last level UPSERT into REPLACE
+ *                           /
  * STATEMENT: REPL     DEL UPS     REPL
  * LSN:        5       6    7        8
  * READ VIEW:               *
@@ -161,7 +163,7 @@ test_basic(void)
 	const struct vy_stmt_template content[] = {
 		STMT_TEMPLATE(5, REPLACE, 1, 1),
 		STMT_TEMPLATE(6, DELETE, 1),
-		STMT_TEMPLATE(7, UPSERT, 1, 2),
+		STMT_TEMPLATE(7, REPLACE, 1, 2),
 		STMT_TEMPLATE(8, REPLACE, 1, 3),
 	};
 	const struct vy_stmt_template expected[] = { content[3], content[2] };
@@ -391,6 +393,69 @@ test_basic(void)
 				       expected, expected_count,
 				       vlsns, vlsns_count, true, false);
 }
+{
+/*
+ * STATEMENT: UPS   REPL  UPS  UPS  DEL  UPS  UPS
+ * LSN:        6     7     8    9    10   11   12
+ * READ VIEW:  *     *     *    *    *    *    *
+ *                   |   \________/  |  \________/
+ *                   +---- apply     +---- apply
+ */
+	const struct vy_stmt_template content[] = {
+		STMT_TEMPLATE(6, UPSERT, 1, 1),
+		STMT_TEMPLATE(7, REPLACE, 1, 2),
+		STMT_TEMPLATE(8, UPSERT, 1, 3),
+		STMT_TEMPLATE(9, UPSERT, 1, 4),
+		STMT_TEMPLATE(10, DELETE, 1),
+		STMT_TEMPLATE(11, UPSERT, 1, 5),
+		STMT_TEMPLATE(12, UPSERT, 1, 6),
+	};
+	const struct vy_stmt_template expected[] = {
+		STMT_TEMPLATE(12, REPLACE, 1, 5),
+		STMT_TEMPLATE(11, REPLACE, 1, 5),
+		content[4],
+		STMT_TEMPLATE(9, REPLACE, 1, 2),
+		STMT_TEMPLATE(8, REPLACE, 1, 2),
+		content[1],
+		content[0],
+	};
+	const int vlsns[] = {6, 7, 8, 9, 10, 11, 12};
+	int content_count = sizeof(content) / sizeof(content[0]);
+	int expected_count = sizeof(expected) / sizeof(expected[0]);
+	int vlsns_count = sizeof(vlsns) / sizeof(vlsns[0]);
+	compare_write_iterator_results(key_def, content, content_count,
+				       expected, expected_count,
+				       vlsns, vlsns_count, true, false);
+}
+{
+/*
+ * STATEMENT: UPS   UPS   UPS
+ * LSN:       6     7     8
+ * READ VIEW: *     *     *     *(9)
+ *            |   \_________/\_____/
+ *            +----- apply   nullify
+ *            |
+ *            +-- turn into REPLACE as last level UPSERT.
+ */
+	const struct vy_stmt_template content[] = {
+		STMT_TEMPLATE(6, UPSERT, 1, 1),
+		STMT_TEMPLATE(7, UPSERT, 1, 2),
+		STMT_TEMPLATE(8, UPSERT, 1, 3),
+	};
+	const struct vy_stmt_template expected[] = {
+		STMT_TEMPLATE(8, REPLACE, 1, 1),
+		STMT_TEMPLATE(7, REPLACE, 1, 1),
+		STMT_TEMPLATE(6, REPLACE, 1, 1),
+	};
+	const int vlsns[] = {6, 7, 8, 9};
+	int content_count = sizeof(content) / sizeof(content[0]);
+	int expected_count = sizeof(expected) / sizeof(expected[0]);
+	int vlsns_count = sizeof(vlsns) / sizeof(vlsns[0]);
+	compare_write_iterator_results(key_def, content, content_count,
+				       expected, expected_count,
+				       vlsns, vlsns_count, true, true);
+}
+
 	box_key_def_delete(key_def);
 	fiber_gc();
 	footer();

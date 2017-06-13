@@ -1,5 +1,5 @@
 	*** test_basic ***
-1..36
+1..48
 ok 1 - stmt 0 is correct
 ok 2 - stmt 1 is correct
 ok 3 - stmt 2 is correct
@@ -36,4 +36,16 @@ ok 33 - stmt 0 is correct
 ok 34 - correct results count
 ok 35 - stmt 0 is correct
 ok 36 - correct results count
+ok 37 - stmt 0 is correct
+ok 38 - stmt 1 is correct
+ok 39 - stmt 2 is correct
+ok 40 - stmt 3 is correct
+ok 41 - stmt 4 is correct
+ok 42 - stmt 5 is correct
+ok 43 - stmt 6 is correct
+ok 44 - correct results count
+ok 45 - stmt 0 is correct
+ok 46 - stmt 1 is correct
+ok 47 - stmt 2 is correct
+ok 48 - correct results count
 	*** test_basic: done ***

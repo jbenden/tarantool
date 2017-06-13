@@ -113,6 +113,18 @@
  * then there is no necessity to write this UPDATE. Actually,
  * existance of such UPDATEs is simply ignored.
  *
+ * ---------------------------------------------------------------
+ * Optimization 4: apply UPSERTs to older REPLACEs.
+ * If the key versions sequence contains UPSERTs and at least one
+ * older DELETE/REPLACE, or it is the last level, then UPSERTs can
+ * be turned into REPLACEs.
+ *
+ * Versions:  ...  REPL   UPS   UPS   ...   DEL   UPS   UPS   ...
+ *                   |   \__________/        |   \_________/
+ *                   +---- apply to          +--- apply to
+ * Result
+ * versions:  ... REPL   REPL  REPL   ...  REPL   REPL  REPL  ...
+ *
  * See implementation details in vy_write_iterator_next_key.
  */
 
