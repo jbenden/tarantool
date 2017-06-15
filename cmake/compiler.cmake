@@ -115,24 +115,25 @@ set (CMAKE_CXX_FLAGS_RELWITHDEBINFO
 
 unset(CC_DEBUG_OPT)
 
-option(ENABLE_BACKTRACE "Enable output of fiber backtrace information in 'show
-fiber' administrative command. Only works on x86 architectures, if compiled
-with gcc. If GNU binutils and binutils-dev libraries are installed, backtrace
-is output with resolved function (symbol) names. Otherwise only frame
-addresses are printed." ${CMAKE_COMPILER_IS_GNUCC})
+check_include_file(libunwind.h HAVE_LIBUNWIND_H)
+find_library(UNWIND_LIBRARY PATH_SUFFIXES system NAMES unwind)
+
+set(ENABLE_BACKTRACE_DEFAULT OFF)
+if (UNWIND_LIBRARY AND HAVE_LIBUNWIND_H)
+    set(ENABLE_BACKTRACE_DEFAULT ON)
+endif()
+
+option(ENABLE_BACKTRACE "Enable output of fiber backtrace information in
+'fiber.info()' command." ${ENABLE_BACKTRACE_DEFAULT})
 
 if (ENABLE_BACKTRACE)
-    # unwind is required.
-    find_library(UNWIND_LIBRARY PATH_SUFFIXES system NAMES unwind)
-    set(CMAKE_REQUIRED_DEFINITIONS -DPACKAGE=${PACKAGE} -DPACKAGE_VERSION=${PACKAGE_VERSION})
-    check_include_file(libunwind.h LIBUNWIND_H)
-    set(CMAKE_REQUIRED_DEFINITIONS)
-    set (UNWIND_LIBRARIES ${UNWIND_LIBRARY})
-    if (NOT (UNWIND_LIBRARY AND LIBUNWIND_H))
+    # unwind is required
+    if (NOT (UNWIND_LIBRARY AND HAVE_LIBUNWIND_H))
         message (FATAL_ERROR "ENABLE_BACKTRACE option is set but unwind "
                              "library is not found")
     endif()
-    find_package_message(UNWIND_LIBRARIES "Found unwind" ${UNWIND_LIBRARIES})
+    set (UNWIND_LIBRARIES ${UNWIND_LIBRARY})
+    find_package_message(UNWIND_LIBRARIES "Found unwind" "${UNWIND_LIBRARIES}")
 endif()
 
 #
