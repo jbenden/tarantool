@@ -550,30 +550,6 @@ alter_space_commit(struct trigger *trigger, void * /* event */)
 {
 	struct alter_space *alter = (struct alter_space *) trigger->data;
 	/*
-	 * If an index is unchanged, all its properties, including
-	 * ID are intact. Move this index here. If an index is
-	 * changed, even if this is a minor change, there is a
-	 * ModifyIndex instance which will move the index from an
-	 * old position to the new one.
-	 */
-	for (uint32_t i = 0; i < alter->new_space->index_count; i++) {
-		Index *new_index = alter->new_space->index[i];
-		Index *old_index = space_index(alter->old_space,
-					       index_id(new_index));
-		/*
-		 * Move unchanged index from the old space to the
-		 * new one.
-		 */
-		if (old_index != NULL &&
-		    index_def_cmp(new_index->index_def,
-				  old_index->index_def) == 0) {
-			space_swap_index(alter->old_space,
-					 alter->new_space,
-					 index_id(old_index),
-					 index_id(new_index));
-		}
-	}
-	/*
 	 * Commit alter ops, this will move the changed
 	 * indexes into their new places.
 	 */
@@ -581,32 +557,10 @@ alter_space_commit(struct trigger *trigger, void * /* event */)
 	rlist_foreach_entry(op, &alter->ops, link) {
 		op->commit(alter);
 	}
-	/* Rebuild index maps once for all indexes. */
-	space_fill_index_map(alter->old_space);
-	space_fill_index_map(alter->new_space);
-	/*
-	 * Don't forget about space triggers.
-	 */
-	rlist_swap(&alter->new_space->on_replace,
-		   &alter->old_space->on_replace);
-	rlist_swap(&alter->new_space->on_stmt_begin,
-		   &alter->old_space->on_stmt_begin);
-	/*
-	 * Init space bsize.
-	 */
-	if (alter->new_space->index_count != 0)
-		alter->new_space->bsize = alter->old_space->bsize;
-	/*
-	 * The new space is ready. Time to update the space
-	 * cache with it.
-	 */
 	alter->old_space->handler->commitAlterSpace(alter->old_space,
 						    alter->new_space);
-
-	struct space *old_space = space_cache_replace(alter->new_space);
 	alter->new_space = NULL; /* for alter_space_delete(). */
-	assert(old_space == alter->old_space);
-	space_delete(old_space);
+	space_delete(alter->old_space);
 	alter_space_delete(alter);
 }
 
@@ -622,6 +576,55 @@ static void
 alter_space_rollback(struct trigger *trigger, void * /* event */)
 {
 	struct alter_space *alter = (struct alter_space *) trigger->data;
+
+	/*
+	 * If an index is unchanged, all its properties, including
+	 * ID are intact. Move this index here. If an index is
+	 * changed, even if this is a minor change, there is a
+	 * ModifyIndex instance which will move the index from an
+	 * old position to the new one.
+	 */
+	for (uint32_t i = 0; i <= alter->new_space->index_id_max; i++) {
+		Index *new_index = space_index(alter->new_space, i);
+		if (new_index == NULL)
+			continue;
+		Index *old_index = space_index(alter->old_space, i);
+		if (old_index == NULL)
+			continue;
+		/*
+		 * Move unchanged index from the old space to the
+		 * new one.
+		 */
+		if (index_def_cmp(new_index->index_def,
+				  old_index->index_def) == 0) {
+			space_swap_index(alter->old_space,
+					 alter->new_space,
+					 i, i);
+			continue;
+		}
+		if (!index_def_change_requires_rebuild(old_index->index_def,
+						       new_index->index_def)) {
+			/* Index was not rebuild, swap and restore index def */
+			space_swap_index(alter->old_space,
+					 alter->new_space,
+					 i, i);
+			index_def_copy(new_index->index_def,
+				       old_index->index_def);
+		}
+	}
+
+	/* Rebuild index maps once for all indexes. */
+	space_fill_index_map(alter->old_space);
+	space_fill_index_map(alter->new_space);
+	/*
+	 * Don't forget about space triggers.
+	 */
+	rlist_swap(&alter->new_space->on_replace,
+		   &alter->old_space->on_replace);
+	rlist_swap(&alter->new_space->on_stmt_begin,
+		   &alter->old_space->on_stmt_begin);
+
+	space_cache_replace(alter->old_space);
 	alter_space_delete(alter);
 }
 
@@ -719,6 +722,52 @@ alter_space_do(struct txn *txn, struct alter_space *alter,
 	 */
 	rlist_foreach_entry(op, &alter->ops, link)
 		op->alter(alter);
+
+	/*
+	 * If an index is unchanged, all its properties, including
+	 * ID are intact. Move this index here. If an index is
+	 * changed, even if this is a minor change, there is a
+	 * ModifyIndex instance which will move the index from an
+	 * old position to the new one.
+	 */
+	for (uint32_t i = 0; i <= alter->new_space->index_id_max; i++) {
+		Index *new_index = space_index(alter->new_space, i);
+		if (new_index == NULL)
+			continue;
+		Index *old_index = space_index(alter->old_space, i);
+		/*
+		 * Move unchanged index from the old space to the
+		 * new one.
+		 */
+		if (old_index != NULL &&
+		    index_def_cmp(new_index->index_def,
+				  old_index->index_def) == 0) {
+			space_swap_index(alter->old_space,
+					 alter->new_space, i, i);
+		}
+	}
+
+	/* Rebuild index maps once for all indexes. */
+	space_fill_index_map(alter->old_space);
+	space_fill_index_map(alter->new_space);
+	/*
+	 * Don't forget about space triggers.
+	 */
+	rlist_swap(&alter->new_space->on_replace,
+		   &alter->old_space->on_replace);
+	rlist_swap(&alter->new_space->on_stmt_begin,
+		   &alter->old_space->on_stmt_begin);
+	/*
+	 * Init space bsize.
+	 */
+	if (alter->new_space->index_count != 0)
+		alter->new_space->bsize = alter->old_space->bsize;
+	/*
+	 * The new space is ready. Time to update the space
+	 * cache with it.
+	 */
+	space_cache_replace(alter->new_space);
+
 	/*
 	 * Install transaction commit/rollback triggers to either
 	 * finish or rollback the DDL depending on the results of
@@ -863,27 +912,20 @@ class ModifyIndex: public AlterSpaceOp
 public:
 	struct index_def *new_index_def;
 	struct index_def *old_index_def;
-	virtual void alter_def(struct alter_space *alter);
-	virtual void commit(struct alter_space *alter);
+	virtual void alter(struct alter_space *alter);
 	virtual ~ModifyIndex();
 };
 
-/** Update the definition of the new space */
-void
-ModifyIndex::alter_def(struct alter_space *alter)
-{
-	rlist_del_entry(old_index_def, link);
-	rlist_add_entry(&alter->key_list, new_index_def, link);
-}
-
 /** Move the index from the old space to the new one. */
 void
-ModifyIndex::commit(struct alter_space *alter)
+ModifyIndex::alter(struct alter_space *alter)
 {
 	/* Move the old index to the new place but preserve */
 	space_swap_index(alter->old_space, alter->new_space,
 			 old_index_def->iid, new_index_def->iid);
-	index_def_copy(old_index_def, new_index_def);
+	index_def_copy(space_index(alter->new_space,
+				   new_index_def->iid)->index_def,
+		       new_index_def);
 }
 
 ModifyIndex::~ModifyIndex()
@@ -963,53 +1005,6 @@ AddIndex::alter_def(struct alter_space *alter)
 }
 
 /**
- * A trigger invoked on rollback in old space while the record
- * about alter is being written to the WAL.
- */
-static void
-on_rollback_in_old_space(struct trigger *trigger, void *event)
-{
-	struct txn *txn = (struct txn *) event;
-	Index *new_index = (Index *) trigger->data;
-	/* Remove the failed tuple from the new index. */
-	struct txn_stmt *stmt;
-	stailq_foreach_entry(stmt, &txn->stmts, next) {
-		if (stmt->space->def.id != new_index->index_def->space_id)
-			continue;
-		new_index->replace(stmt->new_tuple, stmt->old_tuple,
-				   DUP_INSERT);
-	}
-}
-
-/**
- * A trigger invoked on replace in old space while
- * the record about alter is being written to the WAL.
- */
-static void
-on_replace_in_old_space(struct trigger *trigger, void *event)
-{
-	struct txn *txn = (struct txn *) event;
-	struct txn_stmt *stmt = txn_current_stmt(txn);
-	Index *new_index = (Index *) trigger->data;
-	/*
-	 * First set a rollback trigger, then do replace, since
-	 * creating the trigger may fail.
-	 */
-	struct trigger *on_rollback =
-		txn_alter_trigger_new(on_rollback_in_old_space, new_index);
-	/*
-	 * In a multi-statement transaction the same space
-	 * may be modified many times, but we need only one
-	 * on_rollback trigger.
-	 */
-	txn_init_triggers(txn);
-	trigger_add_unique(&txn->on_rollback, on_rollback);
-	/* Put the tuple into the new index. */
-	(void) new_index->replace(stmt->old_tuple, stmt->new_tuple,
-				  DUP_INSERT);
-}
-
-/**
  * Optionally build the new index.
  *
  * During recovery the space is often not fully constructed yet
@@ -1052,9 +1047,6 @@ AddIndex::alter(struct alter_space *alter)
 	 */
 	Index *new_index = index_find_xc(alter->new_space, new_index_def->iid);
 	handler->buildSecondaryKey(alter->old_space, alter->new_space, new_index);
-	on_replace = txn_alter_trigger_new(on_replace_in_old_space,
-					   new_index);
-	trigger_add(&alter->old_space->on_replace, on_replace);
 }
 
 void
