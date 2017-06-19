@@ -7526,8 +7526,7 @@ vy_merge_iterator_next_lsn(struct vy_merge_iterator *itr, struct tuple **ret)
  */
 static NODISCARD int
 vy_merge_iterator_squash_upsert(struct vy_merge_iterator *itr,
-				struct tuple **ret, bool suppress_error,
-				struct vy_stat *stat)
+				struct tuple **ret, struct vy_stat *stat)
 {
 	*ret = NULL;
 	struct tuple *t = itr->curr_stmt;
@@ -7549,7 +7548,7 @@ vy_merge_iterator_squash_upsert(struct vy_merge_iterator *itr,
 		struct tuple *applied;
 		assert(itr->is_primary);
 		applied = vy_apply_upsert(t, next, itr->key_def, itr->format,
-					  itr->upsert_format, suppress_error);
+					  itr->upsert_format, true);
 		if (stat != NULL)
 			rmean_collect(stat->rmean, VY_STAT_UPSERT_APPLIED, 1);
 		tuple_unref(t);
@@ -7886,7 +7885,7 @@ vy_read_iterator_next(struct vy_read_iterator *itr, struct tuple **result)
 			rc = 0; /* No more data. */
 			break;
 		}
-		rc = vy_merge_iterator_squash_upsert(mi, &t, true, stat);
+		rc = vy_merge_iterator_squash_upsert(mi, &t, stat);
 		if (rc != 0) {
 			if (rc == -1)
 				goto clear;
