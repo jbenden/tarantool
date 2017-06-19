@@ -195,19 +195,12 @@ vy_run_env_destroy(struct vy_run_env *env)
  */
 static int
 vy_page_info_create(struct vy_page_info *page_info, uint64_t offset,
-		    const struct tuple *min_key, const struct key_def *key_def)
+		    const char *min_key)
 {
 	memset(page_info, 0, sizeof(*page_info));
 	page_info->offset = offset;
 	page_info->unpacked_size = 0;
-	struct region *region = &fiber()->gc;
-	size_t used = region_used(region);
-	uint32_t size;
-	const char *region_key = tuple_extract_key(min_key, key_def, &size);
-	if (region_key == NULL)
-		return -1;
-	page_info->min_key = vy_key_dup(region_key);
-	region_truncate(region, used);
+	page_info->min_key = vy_key_dup(min_key);
 	return page_info->min_key == NULL ? -1 : 0;
 }
 
@@ -1947,9 +1940,11 @@ vy_run_recover(struct vy_run *run, const char *dir,
 	xlog_cursor_close(&cursor, true);
 	return 0;
 
-	fail_close:
+fail_close:
 	xlog_cursor_close(&cursor, false);
-	fail:
+fail:
+	free(run->page_info);
+	run->page_info = NULL;
 	return -1;
 }
 
@@ -2057,11 +2052,12 @@ vy_run_write_page(struct vy_run *run, struct xlog *data_xlog,
 	}
 	assert(*page_info_capacity >= run->info.page_count);
 
+	/* See comment to run_info->max_key allocation below. */
+	region_key = tuple_extract_key(*curr_stmt, key_def, NULL);
+	if (region_key == NULL)
+		goto error_row_index;
+
 	if (run->info.page_count == 0) {
-		/* See comment to run_info->max_key allocation below. */
-		region_key = tuple_extract_key(*curr_stmt, key_def, NULL);
-		if (region_key == NULL)
-			goto error_row_index;
 		assert(run->info.min_key == NULL);
 		run->info.min_key = vy_key_dup(region_key);
 		if (run->info.min_key == NULL)
@@ -2069,7 +2065,7 @@ vy_run_write_page(struct vy_run *run, struct xlog *data_xlog,
 	}
 
 	page = run->page_info + run->info.page_count;
-	vy_page_info_create(page, data_xlog->offset, *curr_stmt, key_def);
+	vy_page_info_create(page, data_xlog->offset, region_key);
 	xlog_tx_begin(data_xlog);
 
 	/* Last written statement */
@@ -2433,6 +2429,9 @@ static int
 vy_run_write_index(struct vy_run *run, const char *dirpath,
 		   uint32_t space_id, uint32_t iid)
 {
+	struct region *region = &fiber()->gc;
+	size_t mem_used = region_used(region);
+
 	char path[PATH_MAX];
 	vy_run_snprint_path(path, sizeof(path), dirpath,
 			    space_id, iid, run->id, VY_FILE_INDEX);
@@ -2466,10 +2465,10 @@ vy_run_write_index(struct vy_run *run, const char *dirpath,
 	    xlog_rename(&index_xlog) < 0)
 		goto fail;
 	xlog_close(&index_xlog, false);
-	fiber_gc();
+	region_truncate(region, mem_used);
 	return 0;
-	fail:
-	fiber_gc();
+fail:
+	region_truncate(region, mem_used);
 	xlog_tx_rollback(&index_xlog);
 	xlog_close(&index_xlog, false);
 	unlink(path);
@@ -2511,6 +2510,138 @@ vy_run_write(struct vy_run *run, const char *dirpath,
 	*written += run->count.bytes_compressed;
 	*dumped_statements += run->count.rows;
 	return 0;
+}
+
+int
+vy_run_rebuild_index(struct vy_run *run, char *dir,
+		     uint32_t space_id, uint32_t iid,
+		     const struct key_def *key_def,
+		     struct tuple_format *space_format,
+		     struct tuple_format *upsert_format,
+		     const struct index_opts *opts)
+{
+	struct region *region = &fiber()->gc;
+	size_t mem_used = region_used(region);
+
+	struct xlog_cursor cursor;
+	char path[PATH_MAX];
+	vy_run_snprint_path(path, sizeof(path), dir,
+			    space_id, iid, run->id, VY_FILE_RUN);
+
+	if (xlog_cursor_open(&cursor, path))
+		return -1;
+
+	int rc = 0;
+	struct vy_page_info *page_info;
+	uint32_t page_info_capacity = 0;
+	uint32_t run_row_count = 0;
+
+	const char *key = NULL;
+	int64_t max_lsn = 0;
+	int64_t min_lsn = INT64_MAX;
+
+	off_t page_offset, next_page_offset = xlog_cursor_pos(&cursor);
+	while ((rc = xlog_cursor_next_tx(&cursor)) == 0) {
+		page_offset = next_page_offset;
+		next_page_offset = xlog_cursor_pos(&cursor);
+
+		if (run->info.page_count == page_info_capacity) {
+			page_info_capacity += page_info_capacity > 0 ?
+					      page_info_capacity : 16;
+			page_info = (struct vy_page_info *)
+				realloc(run->page_info,
+					sizeof(*page_info) * (page_info_capacity));
+			if (page_info == NULL) {
+				diag_set(OutOfMemory, sizeof(struct vy_page_info),
+					 "malloc", "struct vy_page_info");
+				goto close_err;
+			}
+			run->page_info = page_info;
+		}
+		const char *page_min_key = NULL;
+		uint32_t page_row_count = 0;
+		uint64_t page_row_index_offset = 0;
+		uint64_t row_offset = xlog_cursor_tx_pos(&cursor);
+
+		struct xrow_header xrow;
+		while ((rc = xlog_cursor_next_row(&cursor, &xrow)) == 0) {
+			if (xrow.type == VY_RUN_ROW_INDEX) {
+				page_row_index_offset = row_offset;
+				row_offset = xlog_cursor_tx_pos(&cursor);
+				continue;
+			}
+			++page_row_count;
+			/* extract key */
+			key = vy_stmt_extract_key(&xrow, key_def,
+						  space_format, upsert_format,
+						  iid == 0);
+			if (key == NULL)
+				goto close_err;
+			if (run->info.min_key == NULL) {
+				run->info.min_key = vy_key_dup(key);
+				if (run->info.min_key == NULL)
+					goto close_err;
+			}
+			if (page_min_key == NULL)
+				page_min_key = key;
+			if (xrow.lsn > max_lsn)
+				max_lsn = xrow.lsn;
+			if (xrow.lsn < min_lsn)
+				min_lsn = xrow.lsn;
+			row_offset = xlog_cursor_tx_pos(&cursor);
+		}
+		struct vy_page_info *info;
+		info = run->page_info + run->info.page_count;
+		if (vy_page_info_create(info, page_offset, page_min_key) != 0)
+			goto close_err;
+		info->row_count = page_row_count;
+		info->size = next_page_offset - page_offset;
+		info->unpacked_size = xlog_cursor_tx_pos(&cursor);
+		info->row_index_offset = page_row_index_offset;
+		++run->info.page_count;
+		run_row_count += page_row_count;
+	}
+
+	if (key != NULL) {
+		run->info.max_key = vy_key_dup(key);
+		if (run->info.max_key == NULL)
+			goto close_err;
+	}
+	run->info.max_lsn = max_lsn;
+	run->info.min_lsn = min_lsn;
+	xlog_cursor_reset(&cursor);
+	if (bloom_create(&run->info.bloom, run_row_count,
+			 opts->bloom_fpr, runtime.quota) != 0) {
+		diag_set(OutOfMemory, 0,
+			 "bloom_create", "bloom");
+		goto close_err;
+	}
+	struct xrow_header xrow;
+	while ((rc = xlog_cursor_next(&cursor, &xrow, false)) == 0) {
+		if (xrow.type == VY_RUN_ROW_INDEX)
+			continue;
+
+		key = vy_stmt_extract_key(&xrow, key_def, space_format,
+					  upsert_format, iid == 0);
+		if (key == NULL)
+			goto close_err;
+		mp_decode_array(&key);
+		bloom_add(&run->info.bloom, key_hash(key, key_def));
+	}
+	run->info.has_bloom = true;
+
+	region_truncate(region, mem_used);
+	run->fd = cursor.fd;
+	xlog_cursor_close(&cursor, true);
+	/* New run index is ready for write, unlink old file if exists */
+	vy_run_snprint_path(path, sizeof(path), dir,
+			    space_id, iid, run->id, VY_FILE_INDEX);
+	unlink(path);
+	return vy_run_write_index(run, dir, space_id, iid);
+close_err:
+	region_truncate(region, mem_used);
+	xlog_cursor_close(&cursor, false);
+	return -1;
 }
 
 /**

@@ -651,3 +651,22 @@ vy_tuple_format_new_upsert(struct tuple_format *space_format)
 	format->extra_size = sizeof(uint8_t);
 	return format;
 }
+
+char *
+vy_stmt_extract_key(struct xrow_header *xrow,
+		    const struct key_def *key_def,
+		    struct tuple_format *space_format,
+		    struct tuple_format *upsert_format,
+		    bool is_primary)
+{
+	struct tuple *tuple;
+	tuple = vy_stmt_decode(xrow, key_def,
+			       xrow->type == IPROTO_UPSERT ? upsert_format :
+							     space_format,
+			       is_primary);
+	if (tuple == NULL)
+		return NULL;
+	char *key = tuple_extract_key(tuple, key_def, NULL);
+	tuple_unref(tuple);
+	return key;
+}

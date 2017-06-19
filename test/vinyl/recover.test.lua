@@ -90,3 +90,43 @@ vyinfo1.range_count == vyinfo2.range_count
 s:drop()
 
 tmp:drop()
+
+test_run:cmd('create server force_recovery with script="vinyl/force_recovery.lua"')
+test_run:cmd('start server force_recovery')
+test_run:cmd('switch force_recovery')
+_ = box.schema.space.create('test', {engine = 'vinyl'}):create_index('pk')
+for i = 0, 9999 do box.space.test:replace({i, i, string.rep('a', 512)}) end
+box.snapshot()
+for i = 10000, 11999 do box.space.test:delete({i - 10000}) end
+box.snapshot()
+for i = 12000, 13999 do box.space.test:upsert({i - 10000, i, string.rep('a', 128)}, {{'+', 2, 5}}) end
+box.snapshot()
+fio = require'fio'
+for _, f in pairs(fio.glob(box.cfg.vinyl_dir .. '/' .. box.space.test.id .. '/0/*.index')) do fio.unlink(f) end
+test_run = require('test_run').new()
+test_run:cmd('switch default')
+test_run:cmd('stop server force_recovery')
+test_run:cmd('start server force_recovery')
+test_run:cmd('switch force_recovery')
+sum = 0
+for k, v in pairs(box.space.test:select()) do sum = sum + v[2] end
+-- should be a sum(2005 .. 4004) + sum(4000 .. 9999) = 48006000
+sum
+box.space.test:truncate()
+_ = box.space.test:create_index('sec', {parts = {4, 'NUM', 2, 'STR'}})
+box.space.test:replace({1, 'a', 2, 3})
+box.space.test:replace({2, 'd', 4, 1})
+box.space.test:replace({3, 'c', 6, 7})
+box.space.test:replace({4, 'b', 6, 3})
+box.snapshot()
+fio = require'fio'
+for _, f in pairs(fio.glob(box.cfg.vinyl_dir .. '/' .. box.space.test.id .. '/0/*.index')) do fio.unlink(f) end
+for _, f in pairs(fio.glob(box.cfg.vinyl_dir .. '/' .. box.space.test.id .. '/1/*.index')) do fio.unlink(f) end
+test_run:cmd('switch default')
+test_run:cmd('stop server force_recovery')
+test_run:cmd('start server force_recovery')
+test_run:cmd('switch force_recovery')
+box.space.test:select()
+box.space.test.index.sec:select()
+test_run:cmd('switch default')
+test_run:cmd('stop server force_recovery')
