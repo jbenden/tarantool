@@ -302,10 +302,9 @@ sql_get_description(struct sqlite3_stmt *stmt, struct obuf *out,
 {
 	assert(count != NULL);
 	int column_count = sqlite3_column_count(stmt);
-	size_t description_size =
-		mp_sizeof_map(1) + mp_sizeof_uint(IPROTO_FIELD_NAME);
-	description_size *= column_count;
 	for (int i = 0; i < column_count; ++i) {
+		size_t size = mp_sizeof_map(1) +
+			      mp_sizeof_uint(IPROTO_FIELD_NAME);
 		const char *name = sqlite3_column_name(stmt, i);
 		/*
 		 * Can not fail, since all column names are
@@ -313,20 +312,17 @@ sql_get_description(struct sqlite3_stmt *stmt, struct obuf *out,
 		 * column_name simply returns them.
 		 */
 		assert(name != NULL);
-		description_size += mp_sizeof_str(strlen(name));
-	}
-	char *pos = (char *) obuf_alloc(out, description_size);
-	if (pos == NULL) {
-		diag_set(OutOfMemory, description_size, "obuf_alloc", "pos");
-		return -1;
-	}
-	*count = (uint32_t) column_count;
-	for (int i = 0; i < column_count; ++i) {
-		const char *name = sqlite3_column_name(stmt, i);
+		size += mp_sizeof_str(strlen(name));
+		char *pos = (char *) obuf_alloc(out, size);
+		if (pos == NULL) {
+			diag_set(OutOfMemory, size, "obuf_alloc", "pos");
+			return -1;
+		}
 		pos = mp_encode_map(pos, 1);
 		pos = mp_encode_uint(pos, IPROTO_FIELD_NAME);
 		pos = mp_encode_str(pos, name, strlen(name));
 	}
+	*count = (uint32_t) column_count;
 	return 0;
 }
 
