@@ -22,77 +22,78 @@ sqlite3_stmt_to_obuf(struct sqlite3_stmt *stmt, struct obuf *out)
 	int column_count = sqlite3_column_count(stmt);
 	assert(column_count > 0);
 	size_t size = mp_sizeof_array(column_count);
-	for (int i = 0; i < column_count; ++i) {
-		int type = sqlite3_column_type(stmt, i);
-		switch(type) {
-			case SQLITE_INTEGER: {
-				int64_t n = sqlite3_column_int64(stmt, i);
-				if (n >= 0)
-					size += mp_sizeof_uint(n);
-				else
-					size += mp_sizeof_int(n);
-				break;
-			}
-			case SQLITE_FLOAT:
-				size += mp_sizeof_double(
-						sqlite3_column_double(stmt, i));
-				break;
-			case SQLITE_TEXT:
-				size += mp_sizeof_str(
-						sqlite3_column_bytes(stmt, i));
-				break;
-			case SQLITE_BLOB:
-				size += mp_sizeof_bin(
-						sqlite3_column_bytes(stmt, i));
-				break;
-			case SQLITE_NULL:
-				size += mp_sizeof_nil();
-				break;
-			default:
-				unreachable();
-		}
-	}
-
 	char *pos = (char *) obuf_alloc(out, size);
-	if (pos == NULL) {
-		diag_set(OutOfMemory, size, "obuf_alloc", "pos");
-		return -1;
-	}
-	pos = mp_encode_array(pos, column_count);
+	if (pos == NULL)
+		goto out_of_mem_err;
+	mp_encode_array(pos, column_count);
+
 	for (int i = 0; i < column_count; ++i) {
 		int type = sqlite3_column_type(stmt, i);
 		switch(type) {
 			case SQLITE_INTEGER: {
 				int64_t n = sqlite3_column_int64(stmt, i);
 				if (n >= 0)
-					pos = mp_encode_uint(pos, n);
+					size = mp_sizeof_uint(n);
 				else
-					pos = mp_encode_int(pos, n);
+					size = mp_sizeof_int(n);
+				pos = (char *) obuf_alloc(out, size);
+				if (pos == NULL)
+					goto out_of_mem_err;
+				if (n >= 0)
+					mp_encode_uint(pos, n);
+				else
+					mp_encode_int(pos, n);
 				break;
 			}
-			case SQLITE_FLOAT:
-				pos = mp_encode_double(pos,
-						sqlite3_column_double(stmt, i));
+			case SQLITE_FLOAT: {
+				double d = sqlite3_column_double(stmt, i);
+				size = mp_sizeof_double(d);
+				pos = (char *) obuf_alloc(out, size);
+				if (pos == NULL)
+					goto out_of_mem_err;
+				mp_encode_double(pos, d);
 				break;
-			case SQLITE_TEXT:
-				pos = mp_encode_str(pos,
+			}
+			case SQLITE_TEXT: {
+				uint32_t len = sqlite3_column_bytes(stmt, i);
+				size = mp_sizeof_str(len);
+				pos = (char *) obuf_alloc(out, size);
+				if (pos == NULL)
+					goto out_of_mem_err;
+				const char *s =
 					(const char *)sqlite3_column_text(stmt,
-									  i),
-					sqlite3_column_bytes(stmt, i));
+									  i);
+				mp_encode_str(pos, s, len);
 				break;
-			case SQLITE_BLOB:
-				pos = mp_encode_bin(pos,
-					sqlite3_column_blob(stmt, i),
-					sqlite3_column_bytes(stmt, i));
+			}
+			case SQLITE_BLOB: {
+				uint32_t len = sqlite3_column_bytes(stmt, i);
+				size = mp_sizeof_bin(len);
+				pos = (char *) obuf_alloc(out, size);
+				if (pos == NULL)
+					goto out_of_mem_err;
+				const char *s =
+					(const char *)sqlite3_column_blob(stmt,
+									  i);
+				mp_encode_bin(pos, s, len);
 				break;
-			case SQLITE_NULL:
-				pos = mp_encode_nil(pos);
+			}
+			case SQLITE_NULL: {
+				size = mp_sizeof_nil();
+				pos = (char *) obuf_alloc(out, size);
+				if (pos == NULL)
+					goto out_of_mem_err;
+				mp_encode_nil(pos);
 				break;
+			}
 			default:
 				unreachable();
 		}
 	}
 	return 0;
+out_of_mem_err:
+	diag_set(OutOfMemory, size, "obuf_alloc", "pos");
+	return -1;
 }
 
 struct sql_parameter *
