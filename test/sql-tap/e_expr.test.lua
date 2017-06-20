@@ -3564,12 +3564,9 @@ do_expr_test("e_expr-30.1.2", " CAST(X'2D363738' AS INTEGER) ", "integer", -678)
 do_expr_test("e_expr-30.1.3", [[ 
   CAST(X'31303030303030' AS INTEGER) 
 ]], "integer", 1000000)
--- MUST_WORK_TEST int 64 #2363
-if 0>0 then
-    do_expr_test("e_expr-30.1.4", [[
-      CAST(X'2D31313235383939393036383432363234' AS INTEGER)
-    ]], "integer", -1125899906842624)
-end
+do_expr_test("e_expr-30.1.4", [[
+  CAST(X'2D31313235383939393036383432363234' AS INTEGER)
+]], "integer", -1125899906842624LL)
 -- MUST_WORK_TEST bd should be restarted? is it necessary?
 if 0>0 then
     X(1561, "X!cmd", [=[["rename","db","db2"]]=])
@@ -3582,7 +3579,7 @@ if 0>0 then
     ]], "integer", 1000000)
     do_expr_test("e_expr-30.1.8", [[
       CAST(X'002D0031003100320035003800390039003900300036003800340032003600320034' AS INTEGER)
-    ]], "integer", -1125899906842624)
+    ]], "integer", -1125899906842624LL)
 
 
     db("close")
@@ -3630,17 +3627,14 @@ do_expr_test("e_expr-31.1.4", " CAST(-0.99999 AS INTEGER) ", "integer", 0)
 -- least possible signed integer (-9223372036854775808) then the result
 -- is the least possible signed integer.
 --
--- MUST_WORK_TEST int 64 #2363
-if 0>0 then
-    do_expr_test("e_expr-31.2.1", " CAST(2e+50 AS INT) ", "integer", 9223372036854775807)
-    do_expr_test("e_expr-31.2.2", " CAST(-2e+50 AS INT) ", "integer", -9223372036854775808)
-    do_expr_test("e_expr-31.2.3", [[
-      CAST(-9223372036854775809.0 AS INT)
-    ]], "integer", -9223372036854775808)
-    do_expr_test("e_expr-31.2.4", [[
-      CAST(9223372036854775809.0 AS INT)
-    ]], "integer", 9223372036854775807)
-end
+do_expr_test("e_expr-31.2.1", " CAST(2e+50 AS INT) ", "integer", 9223372036854775807LL)
+do_expr_test("e_expr-31.2.2", " CAST(-2e+50 AS INT) ", "integer", -9223372036854775808LL)
+do_expr_test("e_expr-31.2.3", [[
+  CAST(-9223372036854775809.0 AS INT)
+]], "integer", -9223372036854775808LL)
+do_expr_test("e_expr-31.2.4", [[
+  CAST(9223372036854775809.0 AS INT)
+]], "integer", 9223372036854775807LL)
 -- EVIDENCE-OF: R-09295-61337 Casting a TEXT or BLOB value into NUMERIC
 -- first does a forced conversion into REAL but then further converts the
 -- result into INTEGER if and only if the conversion from REAL to INTEGER
@@ -3657,15 +3651,12 @@ do_expr_test("e_expr-32.1.5", " CAST('11.1abc' AS NUMERIC) ", "real", 11.1)
 --
 do_expr_test("e_expr-32.2.1", " CAST(13.0 AS NUMERIC) ", "real", 13.0)
 do_expr_test("e_expr-32.2.2", " CAST(13.5 AS NUMERIC) ", "real", 13.5)
--- MUST_WORK_TEST int 64 #2363
-if 0>0 then
-    do_expr_test("e_expr-32.2.3", [[
-      CAST(-9223372036854775808 AS NUMERIC)
-    ]], "integer", -9223372036854775808)
-    do_expr_test("e_expr-32.2.4", [[
-      CAST(9223372036854775807 AS NUMERIC)
-    ]], "integer", 9223372036854775807)
-end
+do_expr_test("e_expr-32.2.3", [[
+  CAST(-9223372036854775808 AS NUMERIC)
+]], "integer", -9223372036854775808LL)
+do_expr_test("e_expr-32.2.4", [[
+  CAST(9223372036854775807 AS NUMERIC)
+]], "integer", 9223372036854775807LL)
 -- EVIDENCE-OF: R-64550-29191 Note that the result from casting any
 -- non-BLOB value into a BLOB and the result from casting any BLOB value
 -- into a non-BLOB value may be different depending on whether the

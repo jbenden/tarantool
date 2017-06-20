@@ -1647,15 +1647,13 @@ test:do_execsql_test(
 
 
 
--- MUST_WORK_TEST int 64 #2363
-if 0>0 then
 test:do_execsql_test(
     "func-18.14",
     [[
         SELECT sum(-9223372036854775805);
     ]], {
         -- <func-18.14>
-        -9223372036854775805
+        -9223372036854775805LL
         -- </func-18.14>
     })
 test:do_catchsql_test(
@@ -1666,7 +1664,7 @@ test:do_catchsql_test(
             SELECT -10 AS x);
     ]], {
     -- <func-18.16>
-    0, {9223372036854775797}
+    0, {9223372036854775797LL}
     -- </func-18.16>
 })
 
@@ -1678,11 +1676,10 @@ test:do_catchsql_test(
             SELECT 10 AS x);
     ]], {
     -- <func-18.17>
-    0, {-9223372036854775797}
+    0, {-9223372036854775797LL}
     -- </func-18.17>
 })
 
-end
 test:do_catchsql_test(
     "func-18.15",
     [[
@@ -1755,19 +1752,16 @@ test:do_catchsql_test(
 -- ifcapable compound&&subquery
 -- Integer overflow on abs()
 --
--- MUST_WORK_TEST int 64 #2363
-if 0>0 then
-    test:do_catchsql_test(
-        "func-18.31",
-        [[
-            SELECT abs(-9223372036854775807);
-        ]], {
-            -- <func-18.31>
-            0, {9223372036854775807}
-            -- </func-18.31>
-        })
+test:do_catchsql_test(
+    "func-18.31",
+    [[
+        SELECT abs(-9223372036854775807);
+    ]], {
+        -- <func-18.31>
+        0, {9223372036854775807LL}
+        -- </func-18.31>
+    })
 
-end
 test:do_catchsql_test(
     "func-18.32",
     [[

@@ -92,8 +92,11 @@ local function is_deeply_regex(got, expected)
         end
     end
     if type(expected) == "number" and type(got) == "number" then
-        local min_delta = 0.0000001
-        return (got - expected < min_delta) and (expected - got < min_delta)
+        if got == 0 then
+            return expected == 0
+        end
+        local min_delta = 0.000000001 * math.abs(got)
+        return (got - expected <= min_delta) and (expected - got <= min_delta)
     end
 
     if string_regex_p(expected) then

@@ -154,15 +154,14 @@ end
 -- EVIDENCE-OF: R-41921-05214 The likelihood(X,Y) function returns
 -- argument X unchanged.
 --
--- MUST_WORK_TEST int 64 #2363
-if 0>0 then
+
 test:do_execsql_test(
     "func3-5.1",
     [[
         SELECT likelihood(9223372036854775807, 0.5);
     ]], {
         -- <func3-5.1>
-        9223372036854775807
+        9223372036854775807LL
         -- </func3-5.1>
     })
 
@@ -172,10 +171,10 @@ test:do_execsql_test(
         SELECT likelihood(-9223372036854775808, 0.5);
     ]], {
         -- <func3-5.2>
-        -9223372036854775808
+        -9223372036854775808LL
         -- </func3-5.2>
     })
-end
+
 test:do_execsql_test(
     "func3-5.3",
     [[
@@ -272,15 +271,13 @@ test:do_test(
 -- EVIDENCE-OF: R-11152-23456 The unlikely(X) function returns the
 -- argument X unchanged.
 --
--- MUST_WORK_TEST int 64 #2363
-if 0>0 then
 test:do_execsql_test(
     "func3-5.30",
     [[
         SELECT unlikely(9223372036854775807);
     ]], {
         -- <func3-5.30>
-        9223372036854775807
+        9223372036854775807LL
         -- </func3-5.30>
     })
 
@@ -290,10 +287,9 @@ test:do_execsql_test(
         SELECT unlikely(-9223372036854775808);
     ]], {
         -- <func3-5.31>
-        -9223372036854775808
+        -9223372036854775808LL
         -- </func3-5.31>
     })
-end
 
 test:do_execsql_test(
     "func3-5.32",
@@ -348,15 +344,13 @@ test:do_test(
 -- EVIDENCE-OF: R-23735-03107 The likely(X) function returns the argument
 -- X unchanged.
 --
--- MUST_WORK_TEST int 64 #2363
-if 0>0 then
 test:do_execsql_test(
     "func3-5.50",
     [[
         SELECT likely(9223372036854775807);
     ]], {
         -- <func3-5.50>
-        9223372036854775807
+        9223372036854775807LL
         -- </func3-5.50>
     })
 
@@ -366,10 +360,9 @@ test:do_execsql_test(
         SELECT likely(-9223372036854775808);
     ]], {
         -- <func3-5.51>
-        -9223372036854775808
+        -9223372036854775808LL
         -- </func3-5.51>
     })
-end
 
 test:do_execsql_test(
     "func3-5.52",

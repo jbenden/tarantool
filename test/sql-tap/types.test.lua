@@ -233,18 +233,17 @@ test:do_execsql_test(
         
         -- </types-2.1.7>
     })
--- MUST_WORK_TEST int 64 #2363
-if 0>0 then
+
 test:do_execsql_test(
     "types-2.1.8",
     [[
         SELECT a FROM t1;
     ]], {
         -- <types-2.1.8>
-        0, 120, -120, 30000, -30000, 2100000000, -2100000000, 9000000000000000000, -9000000000000000000
+        0, 120, -120, 30000, -30000, 2100000000, -2100000000, 9000000000000000000LL, -9000000000000000000LL
         -- </types-2.1.8>
     })
-end
+
 -- # Check that all the record sizes are as we expected.
 -- ifcapable legacyformat {
 --   do_test types-2.1.9 {
