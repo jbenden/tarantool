@@ -52,7 +52,7 @@ access_check_space(struct space *space, uint8_t access)
 	 * since ADMIN has universal access.
 	 */
 	access &= ~cr->universal_access;
-	if (access && space->def.uid != cr->uid &&
+	if (access && space->def->uid != cr->uid &&
 	    access & ~space->access[cr->auth_token].effective) {
 		/*
 		 * Report access violation. Throw "no such user"
@@ -62,7 +62,7 @@ access_check_space(struct space *space, uint8_t access)
 		 */
 		struct user *user = user_find_xc(cr->uid);
 		tnt_raise(ClientError, ER_SPACE_ACCESS_DENIED,
-			  priv_name(access), user->def.name, space->def.name);
+			  priv_name(access), user->def.name, space->def->name);
 	}
 }
 
@@ -100,11 +100,14 @@ space_new(struct space_def *def, struct rlist *key_list)
 	space->index_id_max = index_id_max;
 	rlist_create(&space->on_replace);
 	rlist_create(&space->on_stmt_begin);
-	auto scoped_guard = make_scoped_guard([=] { space_delete(space); });
+	auto scoped_guard = make_scoped_guard([=] {
+		space->def = NULL;
+		space_delete(space);
+	});
 
 	space->index_map = (Index **)((char *) space + sizeof(*space) +
 				      index_count * sizeof(Index *));
-	space->def = *def;
+	space->def = def;
 	Engine *engine = engine_find(def->engine_name);
 	struct key_def **keys;
 	keys = (struct key_def **)region_alloc_xc(&fiber()->gc,
@@ -146,6 +149,7 @@ space_delete(struct space *space)
 
 	trigger_destroy(&space->on_replace);
 	trigger_destroy(&space->on_stmt_begin);
+	space_def_delete(space->def);
 	free(space);
 }
 
