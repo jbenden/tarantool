@@ -202,7 +202,7 @@ cbus_endpoint_destroy(struct cbus_endpoint *endpoint,
 	tt_pthread_mutex_lock(&cbus.mutex);
 	/*
 	 * Remove endpoint from cbus registry, so no new pipe can
-	 * be created for this endpoint
+	 * be created for this endpoint.
 	 */
 	rlist_del(&endpoint->in_cbus);
 	tt_pthread_mutex_unlock(&cbus.mutex);
@@ -212,7 +212,12 @@ cbus_endpoint_destroy(struct cbus_endpoint *endpoint,
 			process_cb(endpoint);
 	} while ((endpoint->n_pipes > 0 || !stailq_empty(&endpoint->output)) &&
 		 ipc_cond_wait(&endpoint->cond));
-
+	/*
+	 * Pipe flush func can still lock mutex, so just lock and unlock
+	 * it.
+	 */
+	tt_pthread_mutex_lock(&endpoint->mutex);
+	tt_pthread_mutex_unlock(&endpoint->mutex);
 	tt_pthread_mutex_destroy(&endpoint->mutex);
 	ev_async_stop(endpoint->consumer, &endpoint->async);
 	ipc_cond_destroy(&endpoint->cond);
@@ -237,7 +242,6 @@ cpipe_flush_cb(ev_loop *loop, struct ev_async *watcher, int events)
 	output_was_empty = stailq_empty(&endpoint->output);
 	/** Flush input */
 	stailq_concat(&endpoint->output, &pipe->input);
-	tt_pthread_mutex_unlock(&endpoint->mutex);
 
 	pipe->n_input = 0;
 	if (output_was_empty) {
@@ -246,6 +250,7 @@ cpipe_flush_cb(ev_loop *loop, struct ev_async *watcher, int events)
 
 		ev_async_send(endpoint->consumer, &endpoint->async);
 	}
+	tt_pthread_mutex_unlock(&endpoint->mutex);
 }
 
 void
