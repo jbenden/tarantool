@@ -485,11 +485,6 @@ struct vy_index {
 	 */
 	struct rlist sealed;
 	/**
-	 * Generation of in-memory data stored in this index
-	 * (min over mem->generation).
-	 */
-	int64_t generation;
-	/**
 	 * LSN of the last dump or -1 if the index has not
 	 * been dumped yet.
 	 */
@@ -1199,6 +1194,18 @@ tx_manager_vlsn(struct tx_manager *xm)
 	return oldest->vlsn;
 }
 
+/**
+ * Return generation of in-memory data stored in an index
+ * (min over mem->generation).
+ */
+static int64_t
+vy_index_generation(struct vy_index *index)
+{
+	struct vy_mem *oldest = rlist_empty(&index->sealed) ? index->mem :
+		rlist_last_entry(&index->sealed, struct vy_mem, in_sealed);
+	return oldest->generation;
+}
+
 static void
 vy_index_add_run(struct vy_index *index, struct vy_run *run)
 {
@@ -1364,10 +1371,12 @@ vy_dump_heap_less(struct heap_node *a, struct heap_node *b)
 {
 	struct vy_index *left = container_of(a, struct vy_index, in_dump);
 	struct vy_index *right = container_of(b, struct vy_index, in_dump);
+	int64_t left_generation = vy_index_generation(left);
+	int64_t right_generation = vy_index_generation(right);
 
 	/* Older indexes are dumped first. */
-	if (left->generation != right->generation)
-		return left->generation < right->generation;
+	if (left_generation != right_generation)
+		return left_generation < right_generation;
 	/*
 	 * If a space has more than one index, appending a statement
 	 * to it requires reading the primary index to get the old
@@ -3129,7 +3138,6 @@ delete_mems:
 	}
 	index->version++;
 	index->dump_lsn = dump_lsn;
-	index->generation = task->generation;
 
 	/* The iterator has been cleaned up in a worker thread. */
 	task->wi->iface->close(task->wi);
@@ -3195,7 +3203,7 @@ vy_task_dump_new(struct vy_index *index, struct vy_task **p_task)
 	int64_t generation = scheduler->generation;
 
 	assert(index->pin_count == 0);
-	assert(index->generation < generation);
+	assert(vy_index_generation(index) < generation);
 
 	if (index->is_dropped) {
 		vy_scheduler_remove_index(scheduler, index);
@@ -3242,7 +3250,6 @@ vy_task_dump_new(struct vy_index *index, struct vy_task **p_task)
 
 	if (max_output_count == 0) {
 		/* Nothing to do, pick another index. */
-		index->generation = generation;
 		vy_scheduler_update_index(scheduler, index);
 		return 0;
 	}
@@ -3756,7 +3763,7 @@ retry:
 	if (pn == NULL)
 		return 0; /* nothing to do */
 	struct vy_index *index = container_of(pn, struct vy_index, in_dump);
-	if (index->generation == scheduler->generation)
+	if (vy_index_generation(index) == scheduler->generation)
 		return 0; /* nothing to do */
 	if (vy_task_dump_new(index, ptask) != 0)
 		return -1;
@@ -4907,7 +4914,6 @@ vy_index_new(struct vy_env *e, struct index_def *user_index_def,
 	if (index->mem == NULL)
 		goto fail_mem;
 
-	index->generation = scheduler->generation;
 	index->dump_lsn = -1;
 	vy_cache_create(&index->cache, &e->cache_env, key_def);
 	rlist_create(&index->sealed);
