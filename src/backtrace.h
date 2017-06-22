@@ -38,21 +38,17 @@ extern "C" {
 #endif /* defined(__cplusplus) */
 
 #ifdef ENABLE_BACKTRACE
-
-#define UNW_LOCAL_ONLY
+#include <coro.h>
 #include <libunwind.h>
 
 void print_backtrace();
-
-char *
-backtrace(unw_context_t *unw_ctx);
 
 typedef int (backtrace_cb)(int frameno, void *frameret,
                            const char *func, size_t offset, void *cb_ctx);
 
 
 void
-backtrace_foreach(backtrace_cb cb, unw_context_t *unw_ctx, void *cb_ctx);
+backtrace_foreach(backtrace_cb cb, coro_context *coro_ctx, void *cb_ctx);
 
 #endif /* ENABLE_BACKTRACE */
 

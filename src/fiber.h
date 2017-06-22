@@ -44,11 +44,6 @@
 #include "small/rlist.h"
 #include "salad/stailq.h"
 
-#ifdef ENABLE_BACKTRACE
-#define UNW_LOCAL_ONLY
-#include <libunwind.h>
-#endif
-
 #include <third_party/coro/coro.h>
 
 #if defined(__cplusplus)
@@ -348,9 +343,6 @@ struct fiber {
 	unsigned int stack_id;
 	/* A garbage-collected memory pool. */
 	struct region gc;
-#ifdef ENABLE_BACKTRACE
-	unw_context_t unw_ctx;
-#endif
 	/**
 	 * The fiber which should be scheduled when
 	 * this fiber yields.

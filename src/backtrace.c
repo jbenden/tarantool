@@ -98,13 +98,101 @@ out:
 	return backtrace_buf;
 }
 
+extern void
+coro_unwcontext(unw_context_t *unw_context, struct coro_context *coro_ctx);
+
+int (*unw_getcontext_f)(unw_context_t *) = unw_tdep_getcontext;
+
+__asm__(
+	"\t.text\n"
+	#if _WIN32 || __CYGWIN__ || __APPLE__
+	"\t.globl _coro_unwcontext\n"
+	"_coro_unwcontext:\n"
+	#else
+	"\t.globl coro_unwcontext\n"
+	"coro_unwcontext:\n"
+	#endif
+	#if __amd64
+        "\tpushq %rbp\n"
+        "\tpushq %rbx\n"
+        "\tpushq %r12\n"
+        "\tpushq %r13\n"
+        "\tpushq %r14\n"
+        "\tpushq %r15\n"
+	"\tmovq %rsp, %rcx\n"
+	"\tmovq 0(%rsi), %rsp\n"
+	"\tmovq 0(%rsp), %r12\n"
+	"\tmovq 8(%rsp), %r13\n"
+	"\tmovq 16(%rsp), %r14\n"
+	"\tmovq 24(%rsp), %r15\n"
+	"\tmovq 32(%rsp), %rbx\n"
+	"\tmovq 40(%rsp), %rbp\n"
+	"\tpushq %rcx\n"
+	"\tmovq unw_getcontext_f, %rax\n"
+	"\tcallq *%rax\n"
+	"\tpopq %rcx\n"
+	"\tmovq %rcx, %rsp\n"
+	"\tpopq %r12\n"
+	"\tpopq %r13\n"
+	"\tpopq %r14\n"
+	"\tpopq %r15\n"
+	"\tpopq %rbx\n"
+	"\tpopq %rbp\n"
+	"\tretq\n"
+	#elif __ARM_ARCH==7
+	#elif __aarch64__
+
+         "\tsub x2, sp, #8 * 20\n"
+         "\tstp x19, x20, [x2, #16 * 0]\n"
+         "\tstp x21, x22, [x2, #16 * 1]\n"
+         "\tstp x23, x24, [x2, #16 * 2]\n"
+         "\tstp x25, x26, [x2, #16 * 3]\n"
+         "\tstp x27, x28, [x2, #16 * 4]\n"
+         "\tstp x29, x30, [x2, #16 * 5]\n"
+         "\tstp d8,  d9,  [x2, #16 * 6]\n"
+         "\tstp d10, d11, [x2, #16 * 7]\n"
+         "\tstp d12, d13, [x2, #16 * 8]\n"
+         "\tstp d14, d15, [x2, #16 * 9]\n"
+         "\tldr x3, [x1, #0]\n"
+         "\tldp x19, x20, [x3, #16 * 0]\n"
+         "\tldp x21, x22, [x3, #16 * 1]\n"
+         "\tldp x23, x24, [x3, #16 * 2]\n"
+         "\tldp x25, x26, [x3, #16 * 3]\n"
+         "\tldp x27, x28, [x3, #16 * 4]\n"
+         "\tldp x29, x30, [x3, #16 * 5]\n"
+         "\tldp d8,  d9,  [x3, #16 * 6]\n"
+         "\tldp d10, d11, [x3, #16 * 7]\n"
+         "\tldp d12, d13, [x3, #16 * 8]\n"
+         "\tldp d14, d15, [x3, #16 * 9]\n"
+         "\tstr x2, [x3, #16 * 10]\n"
+	 "\tsub sp, x3, #16\n"
+	"\tbr unw_getcontext_f\n"
+	"\tldr x3, [sp]\n"
+	"\tadd, x3, #16\n"
+         "\tldp x19, x20, [x3, #16 * 0]\n"
+         "\tldp x21, x22, [x3, #16 * 1]\n"
+         "\tldp x23, x24, [x3, #16 * 2]\n"
+         "\tldp x25, x26, [x3, #16 * 3]\n"
+         "\tldp x27, x28, [x3, #16 * 4]\n"
+         "\tldp x29, x30, [x3, #16 * 5]\n"
+         "\tldp d8,  d9,  [x3, #16 * 6]\n"
+         "\tldp d10, d11, [x3, #16 * 7]\n"
+         "\tldp d12, d13, [x3, #16 * 8]\n"
+         "\tldp d14, d15, [x3, #16 * 9]\n"
+         "\tadd sp, x3, #8 * 20\n"
+         "\tret\n"
+	#endif
+);
+
 void
-backtrace_foreach(backtrace_cb cb, unw_context_t *unw_ctx, void *cb_ctx)
+backtrace_foreach(backtrace_cb cb, coro_context *coro_ctx, void *cb_ctx)
 {
+	unw_cursor_t unw_cur;
+	unw_context_t unw_ctx;
+	coro_unwcontext(&unw_ctx, coro_ctx);
+	unw_init_local(&unw_cur, &unw_ctx);
 	int frame_no = 0, status;
 	unw_word_t sp, ip, offset, old_ip = 0;
-	unw_cursor_t unw_cur;
-	unw_init_local(&unw_cur, unw_ctx);
 	int unw_status;
 	while ((unw_status = unw_step(&unw_cur)) > 0) {
 		char proc[80];
@@ -135,12 +223,8 @@ backtrace_foreach(backtrace_cb cb, unw_context_t *unw_ctx, void *cb_ctx)
 void
 print_backtrace()
 {
-	unw_context_t unw_ctx;
 /* arm workaround around register asm variable declaration */
-#define asm __asm__
-	unw_getcontext((unw_context_t *)&unw_ctx);
-#undef asm
-	fdprintf(STDERR_FILENO, "%s", backtrace(&unw_ctx));
+	fdprintf(STDERR_FILENO, "%s", backtrace(NULL));
 }
 #endif /* ENABLE_BACKTRACE */
 
