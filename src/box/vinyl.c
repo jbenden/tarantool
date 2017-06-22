@@ -1481,10 +1481,12 @@ struct vy_scheduler {
 	 */
 	int64_t generation;
 	/**
-	 * Target generation for checkpoint. The scheduler will force
-	 * dumping of all in-memory trees whose generation is less.
+	 * Generation of in-memory data that are currently being dumped.
+	 * The scheduler won't schedule dump of a newer in-memory tree
+	 * until all trees whose generation equals dump_generation have
+	 * been dumped.
 	 */
-	int64_t checkpoint_generation;
+	int64_t dump_generation;
 	/** Time of dump start. */
 	ev_tstamp dump_start;
 	/**
@@ -2912,12 +2914,6 @@ struct vy_task {
 	/** Write iterator producing statements for the new run. */
 	struct vy_stmt_stream *wi;
 	/**
-	 * The current generation at the time of task start.
-	 * On success a dump task dumps all in-memory trees
-	 * whose generation is less.
-	 */
-	int64_t generation;
-	/**
 	 * First (newest) and last (oldest) slices to compact.
 	 *
 	 * While a compaction task is in progress, a new slice
@@ -3129,7 +3125,7 @@ delete_mems:
 	 * Delete dumped in-memory trees.
 	 */
 	rlist_foreach_entry_safe(mem, &index->sealed, in_sealed, next_mem) {
-		if (mem->generation >= task->generation)
+		if (mem->generation > scheduler->dump_generation)
 			continue;
 		rlist_del_entry(mem, in_sealed);
 		vy_stmt_counter_sub(&index->stat.memory.count, &mem->count);
@@ -3187,7 +3183,7 @@ vy_task_dump_abort(struct vy_task *task, bool in_shutdown)
  * Create a task to dump an index.
  *
  * On success the task is supposed to dump all in-memory
- * trees older than @scheduler->generation.
+ * trees whose generation equals scheduler->dump_generation.
  */
 static int
 vy_task_dump_new(struct vy_index *index, struct vy_task **p_task)
@@ -3200,10 +3196,9 @@ vy_task_dump_new(struct vy_index *index, struct vy_task **p_task)
 
 	struct tx_manager *xm = index->env->xm;
 	struct vy_scheduler *scheduler = index->env->scheduler;
-	int64_t generation = scheduler->generation;
 
 	assert(index->pin_count == 0);
-	assert(vy_index_generation(index) < generation);
+	assert(vy_index_generation(index) == scheduler->dump_generation);
 
 	if (index->is_dropped) {
 		vy_scheduler_remove_index(scheduler, index);
@@ -3217,7 +3212,7 @@ vy_task_dump_new(struct vy_index *index, struct vy_task **p_task)
 	}
 
 	/* Rotate the active tree if it needs to be dumped. */
-	if (index->mem->generation < generation &&
+	if (index->mem->generation == scheduler->dump_generation &&
 	    vy_index_rotate_mem(index) != 0)
 		goto err;
 
@@ -3229,7 +3224,7 @@ vy_task_dump_new(struct vy_index *index, struct vy_task **p_task)
 	size_t max_output_count = 0;
 	struct vy_mem *mem, *next_mem;
 	rlist_foreach_entry_safe(mem, &index->sealed, in_sealed, next_mem) {
-		if (mem->generation >= generation)
+		if (mem->generation > scheduler->dump_generation)
 			continue;
 		vy_mem_wait_pinned(mem);
 		if (mem->tree.size == 0) {
@@ -3274,7 +3269,7 @@ vy_task_dump_new(struct vy_index *index, struct vy_task **p_task)
 	if (wi == NULL)
 		goto err_wi;
 	rlist_foreach_entry(mem, &index->sealed, in_sealed) {
-		if (mem->generation >= generation)
+		if (mem->generation > scheduler->dump_generation)
 			continue;
 		if (vy_write_iterator_add_mem(wi, mem) != 0)
 			goto err_wi_sub;
@@ -3282,7 +3277,6 @@ vy_task_dump_new(struct vy_index *index, struct vy_task **p_task)
 
 	task->new_run = new_run;
 	task->wi = wi;
-	task->generation = generation;
 	task->max_output_count = max_output_count;
 	task->bloom_fpr = index->opts.bloom_fpr;
 	task->page_size = index->opts.page_size;
@@ -3633,6 +3627,7 @@ vy_scheduler_new(struct vy_env *env)
 	diag_create(&scheduler->diag);
 	rlist_create(&scheduler->dump_fifo);
 	ipc_cond_create(&scheduler->dump_cond);
+	scheduler->dump_generation = -1;
 	vclock_create(&scheduler->last_checkpoint);
 	scheduler->env = env;
 	vy_compact_heap_create(&scheduler->compact_heap);
@@ -3763,7 +3758,7 @@ retry:
 	if (pn == NULL)
 		return 0; /* nothing to do */
 	struct vy_index *index = container_of(pn, struct vy_index, in_dump);
-	if (vy_index_generation(index) == scheduler->generation)
+	if (vy_index_generation(index) > scheduler->dump_generation)
 		return 0; /* nothing to do */
 	if (vy_task_dump_new(index, ptask) != 0)
 		return -1;
@@ -4105,7 +4100,7 @@ vy_scheduler_stop_workers(struct vy_scheduler *scheduler)
 
 /**
  * Return true if there are in-memory trees that need to
- * be dumped (are older than the current generation).
+ * be dumped (mem->generation equls scheduler->dump_generation).
  */
 static bool
 vy_scheduler_dump_in_progress(struct vy_scheduler *scheduler)
@@ -4113,32 +4108,21 @@ vy_scheduler_dump_in_progress(struct vy_scheduler *scheduler)
 	if (rlist_empty(&scheduler->dump_fifo))
 		return false;
 
-	struct vy_mem *mem = rlist_last_entry(&scheduler->dump_fifo,
-					      struct vy_mem, in_dump_fifo);
-	if (mem->generation == scheduler->generation)
-		return false;
+	struct vy_mem *oldest = rlist_last_entry(&scheduler->dump_fifo,
+						 struct vy_mem, in_dump_fifo);
+	assert(oldest->generation <= scheduler->generation);
+	assert(oldest->generation >= scheduler->dump_generation);
+	return oldest->generation == scheduler->dump_generation;
 
-	assert(mem->generation < scheduler->generation);
-	return true;
-
-}
-
-/** Called to trigger memory dump. */
-static void
-vy_scheduler_trigger_dump(struct vy_scheduler *scheduler)
-{
-	/*
-	 * Increment the generation to trigger dump of
-	 * all in-memory trees.
-	 */
-	scheduler->generation++;
-	scheduler->dump_start = ev_now(loop());
 }
 
 /** Called on memory dump completion. */
 static void
 vy_scheduler_complete_dump(struct vy_scheduler *scheduler)
 {
+	assert(!vy_scheduler_dump_in_progress(scheduler));
+	assert(scheduler->dump_generation < scheduler->generation);
+
 	/*
 	 * All old in-memory trees have been dumped.
 	 * Free memory, release quota, and signal
@@ -4147,7 +4131,7 @@ vy_scheduler_complete_dump(struct vy_scheduler *scheduler)
 	struct lsregion *allocator = &scheduler->env->allocator;
 	struct vy_quota *quota = &scheduler->env->quota;
 	size_t mem_used_before = lsregion_used(allocator);
-	lsregion_gc(allocator, scheduler->generation - 1);
+	lsregion_gc(allocator, scheduler->dump_generation);
 	size_t mem_used_after = lsregion_used(allocator);
 	assert(mem_used_after <= mem_used_before);
 	size_t mem_dumped = mem_used_before - mem_used_after;
@@ -4174,14 +4158,15 @@ vy_scheduler_needs_dump(struct vy_scheduler *scheduler)
 		return true;
 	}
 
-	if (scheduler->checkpoint_in_progress) {
+	if (scheduler->dump_generation < scheduler->generation - 1) {
 		/*
-		 * If checkpoint is in progress, force dumping
-		 * all in-memory data that need to be included
-		 * in the snapshot.
+		 * Dump round complete, but there's more to dump,
+		 * start another one.
 		 */
-		if (scheduler->generation < scheduler->checkpoint_generation)
-			goto trigger_dump;
+		goto trigger_dump;
+	}
+
+	if (scheduler->checkpoint_in_progress) {
 		/*
 		 * Do not trigger another dump until checkpoint
 		 * is complete so as to make sure no statements
@@ -4207,15 +4192,19 @@ vy_scheduler_needs_dump(struct vy_scheduler *scheduler)
 		return false;
 	}
 
+	/* Ran out of quota, force memory dump. */
+	scheduler->generation++;
+
 trigger_dump:
-	vy_scheduler_trigger_dump(scheduler);
+	scheduler->dump_generation++;
+	scheduler->dump_start = ev_now(loop());
 	return true;
 }
 
 static void
 vy_scheduler_add_mem(struct vy_scheduler *scheduler, struct vy_mem *mem)
 {
-	assert(mem->generation <= scheduler->generation);
+	assert(mem->generation == scheduler->generation);
 	assert(rlist_empty(&mem->in_dump_fifo));
 	rlist_add_entry(&scheduler->dump_fifo, mem, in_dump_fifo);
 }
@@ -4224,10 +4213,12 @@ static void
 vy_scheduler_remove_mem(struct vy_scheduler *scheduler, struct vy_mem *mem)
 {
 	assert(mem->generation <= scheduler->generation);
+	assert(mem->generation >= scheduler->dump_generation);
+	assert(!rlist_empty(&scheduler->dump_fifo));
 	assert(!rlist_empty(&mem->in_dump_fifo));
 	rlist_del_entry(mem, in_dump_fifo);
 
-	if (mem->generation < scheduler->generation &&
+	if (mem->generation == scheduler->dump_generation &&
 	    !vy_scheduler_dump_in_progress(scheduler)) {
 		/*
 		 * The last in-memory tree left from the previous
@@ -4262,8 +4253,9 @@ vy_begin_checkpoint(struct vy_env *env)
 		return -1;
 	}
 
+	/* Force dump of all in-memory trees. */
+	scheduler->generation++;
 	scheduler->checkpoint_in_progress = true;
-	scheduler->checkpoint_generation = scheduler->generation + 1;
 	ipc_cond_signal(&scheduler->scheduler_cond);
 	return 0;
 }
@@ -4279,10 +4271,10 @@ vy_wait_checkpoint(struct vy_env *env, struct vclock *vclock)
 	assert(scheduler->checkpoint_in_progress);
 
 	/*
-	 * Wait until all in-memory trees whose generation is
-	 * less than checkpoint_generation have been dumped.
+	 * Wait until all in-memory trees created before
+	 * checkpoint started have been dumped.
 	 */
-	while (scheduler->generation < scheduler->checkpoint_generation ||
+	while (scheduler->dump_generation < scheduler->generation - 1 ||
 	       vy_scheduler_dump_in_progress(scheduler)) {
 		if (scheduler->is_throttled) {
 			/* A dump error occurred, abort checkpoint. */
