@@ -2272,8 +2272,25 @@ fail_range:
 	return false;
 }
 
+/** Initialize the range tree of an index. */
+static int
+vy_index_init_range_tree(struct vy_index *index)
+{
+	struct vy_range *range = vy_range_new(index, -1, NULL, NULL);
+	if (unlikely(range == NULL))
+		return -1;
+
+	assert(index->range_count == 0);
+	vy_index_add_range(index, range);
+	vy_index_acct_range(index, range);
+	return 0;
+}
+
 /**
- * Create an index directory for a new index.
+ * Create a new vinyl index. This function is called when
+ * an index is created after recovery is complete or during
+ * remote recovery. It initializes the range tree and makes
+ * the index directory.
  */
 static int
 vy_index_create(struct vy_index *index)
@@ -2309,14 +2326,7 @@ vy_index_create(struct vy_index *index)
 	}
 
 	/* create initial range */
-	struct vy_range *range = vy_range_new(index, -1, NULL, NULL);
-	if (unlikely(range == NULL))
-		return -1;
-
-	assert(index->range_count == 0);
-	vy_index_add_range(index, range);
-	vy_index_acct_range(index, range);
-	return 0;
+	return vy_index_init_range_tree(index);
 }
 
 /**
@@ -2546,7 +2556,7 @@ vy_index_recover(struct vy_index *index)
 		 * For now, just create the initial range.
 		 */
 		assert(env->status == VINYL_FINAL_RECOVERY_LOCAL);
-		return vy_index_create(index);
+		return vy_index_init_range_tree(index);
 	}
 
 	/*
@@ -4767,7 +4777,7 @@ vy_prepare_truncate_space(struct space *old_space, struct space *new_space)
 			continue;
 		}
 
-		if (vy_index_create(new_index) != 0)
+		if (vy_index_init_range_tree(new_index) != 0)
 			return -1;
 
 		new_index->truncate_count = new_space->truncate_count;
