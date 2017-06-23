@@ -98,21 +98,60 @@ out:
 	return backtrace_buf;
 }
 
-extern void
+void
 coro_unwcontext(unw_context_t *unw_context, struct coro_context *coro_ctx);
 
-int (*unw_getcontext_f)(unw_context_t *) = unw_tdep_getcontext;
 
+static void __attribute__((unused))
+unw_getcontext_f(unw_context_t *unw_ctx, void *stack)
+{
+	unw_getcontext(unw_ctx);
+__asm__(
+#if __amd64
+	/* Restore old context */
+	"\tmovq %0, %%rsp\n"
+	"\tpopq %%r15\n"
+	"\tpopq %%r14\n"
+	"\tpopq %%r13\n"
+	"\tpopq %%r12\n"
+	"\tpopq %%rbx\n"
+	"\tpopq %%rbp\n"
+	"\tretq\n"
+#elif __ARM_ARCH==7
+	"\tmov rsp, %0\n"
+	"\tpop {r4-r11,lr}\n"
+	"\tvpop {d8-d15}\n"
+	"\ret\n"
+#elif __aarch64__
+         "\tldr x3, %0\n"
+         "\tldp x19, x20, [x3, #16 * 0]\n"
+         "\tldp x21, x22, [x3, #16 * 1]\n"
+         "\tldp x23, x24, [x3, #16 * 2]\n"
+         "\tldp x25, x26, [x3, #16 * 3]\n"
+         "\tldp x27, x28, [x3, #16 * 4]\n"
+         "\tldp x29, x30, [x3, #16 * 5]\n"
+         "\tldp d8,  d9,  [x3, #16 * 6]\n"
+         "\tldp d10, d11, [x3, #16 * 7]\n"
+         "\tldp d12, d13, [x3, #16 * 8]\n"
+         "\tldp d14, d15, [x3, #16 * 9]\n"
+	 "\tadd sp, x3, #8 * 20\n"
+	"\tret\n"
+#endif
+	: "=m"(stack)
+	);
+}
 __asm__(
 	"\t.text\n"
 	#if _WIN32 || __CYGWIN__ || __APPLE__
 	"\t.globl _coro_unwcontext\n"
-	"_coro_unwcontext:\n"
+	"\t_coro_unwcontext:\n"
 	#else
 	"\t.globl coro_unwcontext\n"
-	"coro_unwcontext:\n"
+	"\t.type coro_unwcontext, %function\n"
+	"\tcoro_unwcontext:\n"
 	#endif
 	#if __amd64
+	/* Preserve current context */
         "\tpushq %rbp\n"
         "\tpushq %rbx\n"
         "\tpushq %r12\n"
@@ -120,28 +159,35 @@ __asm__(
         "\tpushq %r14\n"
         "\tpushq %r15\n"
 	"\tmovq %rsp, %rcx\n"
+	/* Restore target context */
 	"\tmovq 0(%rsi), %rsp\n"
-	"\tmovq 0(%rsp), %r12\n"
-	"\tmovq 8(%rsp), %r13\n"
-	"\tmovq 16(%rsp), %r14\n"
-	"\tmovq 24(%rsp), %r15\n"
+	"\tmovq 0(%rsp), %r15\n"
+	"\tmovq 8(%rsp), %r14\n"
+	"\tmovq 16(%rsp), %r13\n"
+	"\tmovq 24(%rsp), %r12\n"
 	"\tmovq 32(%rsp), %rbx\n"
 	"\tmovq 40(%rsp), %rbp\n"
-	"\tpushq %rcx\n"
-	"\tmovq unw_getcontext_f, %rax\n"
-	"\tcallq *%rax\n"
-	"\tpopq %rcx\n"
-	"\tmovq %rcx, %rsp\n"
-	"\tpopq %r12\n"
-	"\tpopq %r13\n"
-	"\tpopq %r14\n"
-	"\tpopq %r15\n"
-	"\tpopq %rbx\n"
-	"\tpopq %rbp\n"
-	"\tretq\n"
+	/* Setup return pointer */
+	"\tmovq 48(%rsp), %r11\n"
+	"\tpushq %r11\n"
+	/* Pass old context as second arg */
+	"\tmovq %rcx, %rsi\n"
+	"\tmovq $unw_getcontext_f, %rax\n"
+	"\tjmpq *%rax\n"
 	#elif __ARM_ARCH==7
-	#elif __aarch64__
+/* Save current context */
+	 "\tvpush {d8-d15}\n"
+         "\tpush {r4-r11,lr}\n"
+         "\tmov r2, sp\n"
+/* Restore target context */
+         "\tldr sp, [r1]\n"
+         "\tpop {r4-r11,lr}\n"
+         "\tvpop {d8-d15}\n"
+	 "\tmov r1, r2\n"
+         "\tmov r15, unw_getcontext\n"
+#elif __aarch64__
 
+/* Save current context */
          "\tsub x2, sp, #8 * 20\n"
          "\tstp x19, x20, [x2, #16 * 0]\n"
          "\tstp x21, x22, [x2, #16 * 1]\n"
@@ -153,6 +199,7 @@ __asm__(
          "\tstp d10, d11, [x2, #16 * 7]\n"
          "\tstp d12, d13, [x2, #16 * 8]\n"
          "\tstp d14, d15, [x2, #16 * 9]\n"
+/* Restore target context */
          "\tldr x3, [x1, #0]\n"
          "\tldp x19, x20, [x3, #16 * 0]\n"
          "\tldp x21, x22, [x3, #16 * 1]\n"
@@ -164,23 +211,9 @@ __asm__(
          "\tldp d10, d11, [x3, #16 * 7]\n"
          "\tldp d12, d13, [x3, #16 * 8]\n"
          "\tldp d14, d15, [x3, #16 * 9]\n"
-         "\tstr x2, [x3, #16 * 10]\n"
-	 "\tsub sp, x3, #16\n"
-	"\tbr unw_getcontext_f\n"
-	"\tldr x3, [sp]\n"
-	"\tadd, x3, #16\n"
-         "\tldp x19, x20, [x3, #16 * 0]\n"
-         "\tldp x21, x22, [x3, #16 * 1]\n"
-         "\tldp x23, x24, [x3, #16 * 2]\n"
-         "\tldp x25, x26, [x3, #16 * 3]\n"
-         "\tldp x27, x28, [x3, #16 * 4]\n"
-         "\tldp x29, x30, [x3, #16 * 5]\n"
-         "\tldp d8,  d9,  [x3, #16 * 6]\n"
-         "\tldp d10, d11, [x3, #16 * 7]\n"
-         "\tldp d12, d13, [x3, #16 * 8]\n"
-         "\tldp d14, d15, [x3, #16 * 9]\n"
-         "\tadd sp, x3, #8 * 20\n"
-         "\tret\n"
+	"\tmov sp, x3\n"
+"\tmov x1, x2\n"
+"\tb unw_getcontext_f\n"
 	#endif
 );
 
@@ -198,7 +231,7 @@ backtrace_foreach(backtrace_cb cb, coro_context *coro_ctx, void *cb_ctx)
 		char proc[80];
 		unw_get_reg(&unw_cur, UNW_REG_IP, &ip);
 		if (ip == old_ip) {
-			say_debug("unwinding error: previous frame "
+			say_warn("unwinding error: previous frame "
 				 "identical to this frame (corrupt stack?)");
 			return;
 		}
@@ -217,7 +250,7 @@ backtrace_foreach(backtrace_cb cb, coro_context *coro_ctx, void *cb_ctx)
 		++frame_no;
 	}
 	if (unw_status != 0)
-		say_debug("unwinding error: %s", unw_strerror(unw_status));
+		say_warn("unwinding error: %s", unw_strerror(unw_status));
 }
 
 void

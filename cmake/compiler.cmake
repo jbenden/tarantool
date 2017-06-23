@@ -132,6 +132,7 @@ if (ENABLE_BACKTRACE)
         message (FATAL_ERROR "ENABLE_BACKTRACE option is set but unwind "
                              "library is not found")
     endif()
+    #    set (UNWIND_LIBRARIES ${UNWIND_LIBRARY} unwind-aarch64)
     set (UNWIND_LIBRARIES ${UNWIND_LIBRARY} unwind-x86_64)
     find_package_message(UNWIND_LIBRARIES "Found unwind" "${UNWIND_LIBRARIES}")
 endif()
